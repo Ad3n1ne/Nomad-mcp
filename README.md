@@ -9,8 +9,8 @@ of truth on your local workstation: sync code with `rsync`, run short commands
 over SSH, manage long-running jobs in remote `tmux` sessions, diagnose network
 issues, and pull generated artifacts back into the local project.
 
-nomad is not tied to a specific MCP client. Any agent environment that can start
-a stdio MCP server with a command and arguments can use it.
+Any MCP-enabled agent environment that can start a stdio server with a command
+and arguments can use nomad.
 
 ## Features
 

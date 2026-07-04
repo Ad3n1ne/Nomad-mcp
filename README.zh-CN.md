@@ -4,7 +4,7 @@
 
 nomad 是一个运行在本地的 MCP Server，用来打通“本地写代码 + 远端验证运行”的 Agentic 远程开发工作流。
 
-它不是 Codex 专属工具。只要你的智能体开发环境支持通过 command + args 启动 stdio MCP server，就可以接入 nomad。
+只要你的智能体开发环境支持通过 command + args 启动 stdio MCP server，就可以接入 nomad。
 
 ## 特性
 
