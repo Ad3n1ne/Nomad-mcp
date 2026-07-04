@@ -1,0 +1,6 @@
+include README.zh-CN.md
+recursive-include docs 0*.md
+exclude docs/dev_log.md
+exclude docs/subagent-prompts.md
+exclude docs/Skill-*.md
+prune .agents

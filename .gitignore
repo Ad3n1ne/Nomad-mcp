@@ -1,0 +1,93 @@
+# nomad project-local config. May contain hosts, paths, and env names.
+.nomad.json
+.nomad.json.bak
+.nomad.local.json
+remote_artifacts/
+
+# Python bytecode and build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+active_env/
+
+# Test, lint, type-check, and coverage caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.hypothesis/
+.pyre/
+.pytype/
+.dmypy.json
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Runtime logs and generated outputs
+logs/
+*.log
+audit.log
+tmp/
+.tmp/
+temp/
+.temp/
+artifacts/
+output/
+outputs/
+nomad_filter_*
+
+# Internal planning material, local agent notes, and private prompt drafts
+.agents/
+Skill-*.md
+docs/Skill-*.md
+docs/dev_log.md
+docs/subagent-prompts.md
+*.private.md
+*.local.md
+scratch/
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Editor and IDE files
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
