@@ -3,8 +3,10 @@ import subprocess
 
 from nomad.result import failure_result
 from nomad.ssh import (
+    CONTROLMASTER_ENV_VAR,
     SshConfigError,
     build_ssh_args,
+    execute_remote_cmd_sync,
     probe_ssh_connectivity,
     probe_ssh_connectivity_result,
 )
@@ -27,6 +29,16 @@ def test_build_ssh_args_includes_controlmaster_defaults():
         "BatchMode=yes",
         "gpu-host",
     ]
+
+
+def test_build_ssh_args_can_disable_controlmaster(monkeypatch):
+    monkeypatch.setenv(CONTROLMASTER_ENV_VAR, "0")
+
+    argv = build_ssh_args("gpu-host", timeout=7)
+
+    assert "ControlMaster=no" in argv
+    assert not any(arg.startswith("ControlPath=") for arg in argv)
+    assert "ControlMaster=auto" not in argv
 
 
 def test_build_ssh_args_appends_jump_host():
@@ -202,6 +214,19 @@ def test_probe_ssh_connectivity_result_timeout(monkeypatch):
     )
 
 
+def test_probe_ssh_connectivity_result_oserror(monkeypatch):
+    def fake_run(*args, **kwargs):
+        raise OSError("ssh missing")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = probe_ssh_connectivity_result("gpu-host", timeout=3)
+
+    assert result["ok"] is False
+    assert result["error_type"] == "ssh_unknown_failure"
+    assert "ssh missing" in result["diagnostics"][0]
+
+
 @pytest.mark.parametrize(
     ("stderr", "error_type"),
     [
@@ -247,3 +272,16 @@ def test_probe_ssh_connectivity_result_maps_builder_errors_to_invalid_config():
         recoverable=result["recoverable"],
         diagnostics=result["diagnostics"],
     )
+
+
+def test_execute_remote_cmd_sync_maps_oserror_to_failed_tuple(monkeypatch):
+    def fake_run(*args, **kwargs):
+        raise OSError("ssh missing")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    returncode, stdout, stderr = execute_remote_cmd_sync("gpu-host", "pwd")
+
+    assert returncode == 255
+    assert stdout == ""
+    assert "ssh missing" in stderr

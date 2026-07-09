@@ -253,3 +253,12 @@ def run_remote(cmd: str, target: str = "default") -> str:
             recoverable=True,
             diagnostics=[f"Command exceeded timeout limit of {timeout}s."],
         )
+    except OSError as exc:
+        return failure_result(
+            tool="run_remote",
+            target=target,
+            message=f"Failed to launch SSH command: {exc}",
+            error_type="remote_command_failed",
+            recoverable=True,
+            diagnostics=[str(exc)],
+        )

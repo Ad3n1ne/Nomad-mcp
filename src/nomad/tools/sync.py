@@ -26,7 +26,8 @@ from nomad.security import (
     write_audit_log,
 )
 from nomad.ssh import (
-    CONTROL_PATH,
+    SshConfigError,
+    build_rsync_ssh_command,
     execute_remote_cmd_sync,
     probe_ssh_connectivity_result,
 )
@@ -335,9 +336,7 @@ def sync_push(target: str = "default") -> str:
         tmp_filter.write("\n".join(filter_rules) + "\n")
 
     try:
-        ssh_e = f"ssh -o ControlMaster=auto -o ControlPath={CONTROL_PATH} -o ControlPersist=60s -o ConnectTimeout=5 -o BatchMode=yes"
-        if jump_host:
-            ssh_e += f" -J {jump_host}"
+        ssh_e = build_rsync_ssh_command(timeout=5, jump_host=jump_host)
 
         rsync_argv = [
             "rsync",
@@ -425,6 +424,24 @@ def sync_push(target: str = "default") -> str:
             error_type="command_timeout",
             recoverable=True,
             diagnostics=["rsync process exceeded 60 seconds timeout."],
+        )
+    except OSError as exc:
+        return failure_result(
+            tool="sync_push",
+            target=target,
+            message=f"Failed to launch rsync: {exc}",
+            error_type="rsync_failed",
+            recoverable=True,
+            diagnostics=[str(exc)],
+        )
+    except SshConfigError as exc:
+        return failure_result(
+            tool="sync_push",
+            target=target,
+            message=f"Invalid SSH configuration for rsync: {exc}",
+            error_type="invalid_config",
+            recoverable=True,
+            diagnostics=[str(exc)],
         )
     finally:
         if tmp_filter_path.exists():
@@ -563,12 +580,17 @@ def sync_pull(
         )
 
     remote_source = f"{ssh_host}:{remote_path.rstrip('/')}/{safe_relative_path}"
-    ssh_e = (
-        f"ssh -o ControlMaster=auto -o ControlPath={CONTROL_PATH} "
-        f"-o ControlPersist=60s -o ConnectTimeout=5 -o BatchMode=yes"
-    )
-    if jump_host:
-        ssh_e += f" -J {jump_host}"
+    try:
+        ssh_e = build_rsync_ssh_command(timeout=5, jump_host=jump_host)
+    except SshConfigError as exc:
+        return failure_result(
+            tool="sync_pull",
+            target=target,
+            message=f"Invalid SSH configuration for rsync: {exc}",
+            error_type="invalid_config",
+            recoverable=True,
+            diagnostics=[str(exc)],
+        )
 
     rsync_argv = [
         "rsync",
@@ -591,6 +613,15 @@ def sync_pull(
             error_type="command_timeout",
             recoverable=True,
             diagnostics=["rsync process exceeded 60 seconds timeout."],
+        )
+    except OSError as exc:
+        return failure_result(
+            tool="sync_pull",
+            target=target,
+            message=f"Failed to launch rsync: {exc}",
+            error_type="rsync_failed",
+            recoverable=True,
+            diagnostics=[str(exc)],
         )
 
     if completed.returncode != 0:

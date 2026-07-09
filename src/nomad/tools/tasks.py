@@ -274,6 +274,15 @@ def task_start(cmd: str, task_name: str, target: str = "default") -> str:
             recoverable=True,
             diagnostics=[f"tmux has-session timed out for target '{target}'."],
         )
+    except OSError as exc:
+        return failure_result(
+            tool="task_start",
+            target=target,
+            message=f"Failed to launch tmux status check over SSH: {exc}",
+            error_type="remote_command_failed",
+            recoverable=True,
+            diagnostics=[str(exc)],
+        )
 
 
     tasks_dir = f"{remote_path.rstrip('/')}/.nomad/tasks"
@@ -321,6 +330,15 @@ def task_start(cmd: str, task_name: str, target: str = "default") -> str:
             error_type="command_timeout",
             recoverable=True,
         )
+    except OSError as exc:
+        return failure_result(
+            tool="task_start",
+            target=target,
+            message=f"Failed to launch SSH while writing task script: {exc}",
+            error_type="remote_command_failed",
+            recoverable=True,
+            diagnostics=[str(exc)],
+        )
 
     start_tmux_cmd = (
         f"tmux new-session -d -s {shlex.quote(session_name)} "
@@ -346,6 +364,15 @@ def task_start(cmd: str, task_name: str, target: str = "default") -> str:
             message="Timeout starting tmux session on remote host.",
             error_type="command_timeout",
             recoverable=True,
+        )
+    except OSError as exc:
+        return failure_result(
+            tool="task_start",
+            target=target,
+            message=f"Failed to launch SSH while starting tmux session: {exc}",
+            error_type="remote_command_failed",
+            recoverable=True,
+            diagnostics=[str(exc)],
         )
 
     write_audit_log(
@@ -556,6 +583,8 @@ fi
             diagnostics.append(res.stderr.strip() or f"SSH exited with code {res.returncode}")
     except subprocess.TimeoutExpired:
         diagnostics.append("Status check timeout.")
+    except OSError as exc:
+        diagnostics.append(f"Failed to launch status check over SSH: {exc}")
     except Exception as exc:
         diagnostics.append(str(exc))
 
@@ -760,6 +789,8 @@ fi
                 diagnostics.append(f"Scan failed on target '{t_name}': {res.stderr.strip()}")
         except subprocess.TimeoutExpired:
             diagnostics.append(f"Scan timed out on target '{t_name}'.")
+        except OSError as exc:
+            diagnostics.append(f"Failed to launch scan on target '{t_name}': {exc}")
         except Exception as exc:
             diagnostics.append(f"Scan failed on target '{t_name}': {exc}")
 
@@ -901,6 +932,15 @@ def task_kill(task_name: str, target: str = "default") -> str:
             message="Timeout killing tmux session on remote host.",
             error_type="command_timeout",
             recoverable=True,
+        )
+    except OSError as exc:
+        return failure_result(
+            tool="task_kill",
+            target=target,
+            message=f"Failed to launch SSH while killing tmux session: {exc}",
+            error_type="remote_command_failed",
+            recoverable=True,
+            diagnostics=[str(exc)],
         )
 
     write_audit_log(

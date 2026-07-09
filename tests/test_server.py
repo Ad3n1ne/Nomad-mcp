@@ -1,6 +1,6 @@
 import json
-import asyncio
-from nomad.server import mcp_server, get_current_project_resource
+import os
+from nomad.server import _safe_resource, _safe_tool, health, mcp_server, get_current_project_resource
 
 
 def test_server_tools_registered():
@@ -17,6 +17,7 @@ def test_server_tools_registered():
         "tunnel_status",
         "tunnel_stop",
         "net_diagnose",
+        "health",
     }
     expected_phase2_tools = {
         "task_start",
@@ -26,6 +27,83 @@ def test_server_tools_registered():
     }
     assert expected_phase1_tools.issubset(registered_tools)
     assert expected_phase2_tools.issubset(registered_tools)
+
+
+def test_health_returns_process_metadata(tmp_path, monkeypatch):
+    log_path = tmp_path / "nomad-mcp.log"
+    monkeypatch.setenv("NOMAD_MCP_LOG_PATH", str(log_path))
+
+    res = json.loads(health())
+
+    assert res["ok"] is True
+    assert res["tool"] == "health"
+    assert res["data"]["pid"] == os.getpid()
+    assert res["data"]["cwd"]
+    assert res["data"]["version"]
+    assert res["data"]["log_path"] == str(log_path)
+
+
+def test_safe_tool_catches_exception_and_logs_traceback(tmp_path, monkeypatch):
+    log_path = tmp_path / "nomad-mcp.log"
+    monkeypatch.setenv("NOMAD_MCP_LOG_PATH", str(log_path))
+
+    def boom(target: str = "default") -> str:
+        raise RuntimeError("kaboom")
+
+    wrapped = _safe_tool(boom)
+    res = json.loads(wrapped(target="gpu"))
+
+    assert res["ok"] is False
+    assert res["tool"] == "boom"
+    assert res["target"] == "gpu"
+    assert res["error_type"] == "internal_error"
+    assert str(log_path) in res["diagnostics"][1]
+    log_content = log_path.read_text(encoding="utf-8")
+    assert "tool entry name=boom" in log_content
+    assert "tool exception name=boom" in log_content
+    assert "RuntimeError: kaboom" in log_content
+    assert "Traceback" in log_content
+
+
+def test_safe_tool_redacts_sensitive_params_from_log(tmp_path, monkeypatch):
+    log_path = tmp_path / "nomad-mcp.log"
+    monkeypatch.setenv("NOMAD_MCP_LOG_PATH", str(log_path))
+
+    def accepts_sensitive(cmd: str, config_json: str, target: str = "default") -> str:
+        return json.dumps({"ok": True, "tool": "accepts_sensitive", "target": target})
+
+    wrapped = _safe_tool(accepts_sensitive)
+    wrapped(
+        "curl -H 'Authorization: Bearer secret-token' https://example.test",
+        '{"runtime":{"extra_env":{"API_TOKEN":"supersecret"}}}',
+        target="gpu",
+    )
+
+    log_content = log_path.read_text(encoding="utf-8")
+    assert "secret-token" not in log_content
+    assert "supersecret" not in log_content
+    assert "Authorization" not in log_content
+    assert '"cmd": "<redacted str len=' in log_content
+    assert '"config_json": "<redacted str len=' in log_content
+    assert '"target": "gpu"' in log_content
+
+
+def test_safe_resource_catches_exception_and_logs_traceback(tmp_path, monkeypatch):
+    log_path = tmp_path / "nomad-mcp.log"
+    monkeypatch.setenv("NOMAD_MCP_LOG_PATH", str(log_path))
+
+    def broken_resource() -> str:
+        raise ValueError("resource broke")
+
+    wrapped = _safe_resource(broken_resource)
+    res = json.loads(wrapped())
+
+    assert res["ok"] is False
+    assert res["tool"] == "broken_resource"
+    assert res["error_type"] == "internal_error"
+    log_content = log_path.read_text(encoding="utf-8")
+    assert "resource exception name=broken_resource" in log_content
+    assert "ValueError: resource broke" in log_content
 
 
 def test_resource_unconfigured(tmp_path, monkeypatch):

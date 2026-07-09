@@ -65,7 +65,7 @@ def _check_tunnel_master(socket_path: str, ssh_host: str, jump_host: str | None 
         cmd = build_ssh_control_args(ssh_host, socket_path, "check", jump_host=jump_host)
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
         return res.returncode == 0
-    except (SshConfigError, subprocess.TimeoutExpired):
+    except (SshConfigError, subprocess.TimeoutExpired, OSError):
         return False
 
 
@@ -78,7 +78,10 @@ def _check_remote_port_in_use(
         f"lsof -i:{remote_bind_port} || "
         f"ss -tulpn | grep :{remote_bind_port}"
     )
-    ret, _, _ = execute_remote_cmd_sync(ssh_host, remote_cmd, jump_host=jump_host, timeout=5)
+    try:
+        ret, _, _ = execute_remote_cmd_sync(ssh_host, remote_cmd, jump_host=jump_host, timeout=5)
+    except subprocess.TimeoutExpired:
+        return False
     return ret == 0
 
 
@@ -186,6 +189,12 @@ def _read_ssh_config(
             "config": _default_ssh_config(ssh_host),
             "error": "ssh -G timed out after 5 seconds.",
         }
+    except OSError as exc:
+        return {
+            "ok": False,
+            "config": _default_ssh_config(ssh_host),
+            "error": f"ssh -G failed to launch: {exc}",
+        }
 
     if completed.returncode != 0:
         return {
@@ -282,6 +291,15 @@ def _check_direct_tcp(hostname: str, port: int | str) -> dict[str, Any]:
             "stderr": "nc timed out after 4 seconds.",
             "cmd": cmd,
         }
+    except OSError as exc:
+        return {
+            "status": "error",
+            "host": hostname,
+            "port": port,
+            "returncode": None,
+            "stderr": f"nc failed to launch: {exc}",
+            "cmd": cmd,
+        }
 
     status = "reachable" if completed.returncode == 0 else "unreachable"
     return {
@@ -326,6 +344,14 @@ def _run_ssh_batch(
             "classification": "timeout",
             "returncode": None,
             "stderr": "SSH batch test timed out after 5 seconds.",
+            "cmd": cmd,
+        }
+    except OSError as exc:
+        return {
+            "status": "failed",
+            "classification": "unknown",
+            "returncode": None,
+            "stderr": f"ssh batch test failed to launch: {exc}",
             "cmd": cmd,
         }
 
@@ -374,6 +400,8 @@ def _build_diagnosis_suggestions(
         suggestions.append("Direct TCP port test timed out; check network reachability, firewall, or routing.")
     elif direct_tcp.get("status") == "unreachable":
         suggestions.append("Direct TCP port is unreachable; verify the host, port, firewall, or required jump host.")
+    elif direct_tcp.get("status") == "error":
+        suggestions.append("Direct TCP port test could not run locally; check that nc is installed and executable.")
 
     classification = ssh_batch.get("classification")
     if classification == "permission_denied":
@@ -552,6 +580,15 @@ def tunnel_start(target: str = "default") -> str:
             message="Reverse tunnel start process timed out.",
             error_type="command_timeout",
             recoverable=True,
+        )
+    except OSError as exc:
+        return failure_result(
+            tool="tunnel_start",
+            target=target,
+            message=f"Failed to launch reverse tunnel process: {exc}",
+            error_type="tunnel_start_failed",
+            recoverable=True,
+            diagnostics=[str(exc)],
         )
 
     write_audit_log(

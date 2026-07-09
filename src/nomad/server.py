@@ -3,10 +3,30 @@ FastMCP Server Entry Point.
 """
 from __future__ import annotations
 
+import atexit
+import functools
+import inspect
 import json
+import os
+import sys
+import time
+from typing import Any, Callable
+
 from mcp.server.fastmcp import FastMCP
 
+from nomad import __version__
 from nomad.config import ConfigError, guard_remote, load_config
+from nomad.mcp_logging import (
+    format_traceback,
+    get_log_path,
+    get_mcp_logger,
+    log_server_shutdown,
+    log_server_startup,
+    redact_text,
+    summarize_call,
+    summarize_result,
+)
+from nomad.result import failure_result, success_result
 from nomad.tools.commands import run_remote
 from nomad.tools.init import (
     init_discover,
@@ -19,29 +39,138 @@ from nomad.schema import get_config_schema_hints
 from nomad.tools.sync import sync_pull, sync_push
 from nomad.tools.tasks import task_kill, task_list, task_start, task_status
 
+SERVER_START_TIME = time.time()
+
 mcp_server = FastMCP("nomad")
 
+
+def _safe_tool(func: Callable[..., str]) -> Callable[..., str]:
+    """Wraps an MCP tool so exceptions become structured failures, not transport death."""
+    tool_name = func.__name__
+    signature = inspect.signature(func)
+
+    @functools.wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> str:
+        logger = get_mcp_logger()
+        logger.info(
+            "tool entry name=%s params=%s",
+            tool_name,
+            summarize_call(args, kwargs, signature),
+        )
+        try:
+            result = func(*args, **kwargs)
+        except BaseException as exc:
+            target = kwargs.get("target") if isinstance(kwargs.get("target"), str) else None
+            exc_summary = redact_text(f"{type(exc).__name__}: {exc}")
+            logger.error(
+                "tool exception name=%s target=%s exception=%s\n%s",
+                tool_name,
+                target,
+                exc_summary,
+                format_traceback(exc),
+            )
+            return failure_result(
+                tool=tool_name,
+                target=target,
+                message=(
+                    f"Internal error in {tool_name}. "
+                    f"See Nomad MCP log: {get_log_path()}"
+                ),
+                error_type="internal_error",
+                recoverable=True,
+                diagnostics=[exc_summary, f"log_path={get_log_path()}"],
+            )
+        logger.info("tool exit name=%s result=%s", tool_name, summarize_result(result))
+        return result
+
+    wrapper.__signature__ = signature  # type: ignore[attr-defined]
+    return wrapper
+
+
+def _safe_resource(func: Callable[..., str]) -> Callable[..., str]:
+    resource_name = func.__name__
+    signature = inspect.signature(func)
+
+    @functools.wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> str:
+        logger = get_mcp_logger()
+        logger.info(
+            "resource entry name=%s params=%s",
+            resource_name,
+            summarize_call(args, kwargs, signature),
+        )
+        try:
+            result = func(*args, **kwargs)
+        except BaseException as exc:
+            exc_summary = redact_text(f"{type(exc).__name__}: {exc}")
+            logger.error(
+                "resource exception name=%s exception=%s\n%s",
+                resource_name,
+                exc_summary,
+                format_traceback(exc),
+            )
+            return failure_result(
+                tool=resource_name,
+                message=(
+                    f"Internal error in resource {resource_name}. "
+                    f"See Nomad MCP log: {get_log_path()}"
+                ),
+                error_type="internal_error",
+                recoverable=True,
+                diagnostics=[exc_summary, f"log_path={get_log_path()}"],
+            )
+        logger.info("resource exit name=%s result=%s", resource_name, summarize_result(result))
+        return result
+
+    wrapper.__signature__ = signature  # type: ignore[attr-defined]
+    return wrapper
+
+
+def _register_tool(func: Callable[..., str]) -> None:
+    mcp_server.tool()(_safe_tool(func))
+
+
 # Register Phase 1 Tools
-mcp_server.tool()(init_discover)
-mcp_server.tool()(init_verify_and_probe)
-mcp_server.tool()(init_save_config)
-mcp_server.tool()(init_probe_target)
-mcp_server.tool()(sync_push)
-mcp_server.tool()(sync_pull)
-mcp_server.tool()(run_remote)
-mcp_server.tool()(tunnel_start)
-mcp_server.tool()(tunnel_status)
-mcp_server.tool()(tunnel_stop)
-mcp_server.tool()(net_diagnose)
+_register_tool(init_discover)
+_register_tool(init_verify_and_probe)
+_register_tool(init_save_config)
+_register_tool(init_probe_target)
+_register_tool(sync_push)
+_register_tool(sync_pull)
+_register_tool(run_remote)
+_register_tool(tunnel_start)
+_register_tool(tunnel_status)
+_register_tool(tunnel_stop)
+_register_tool(net_diagnose)
 
 # Register Phase 2 Tools
-mcp_server.tool()(task_start)
-mcp_server.tool()(task_status)
-mcp_server.tool()(task_list)
-mcp_server.tool()(task_kill)
+_register_tool(task_start)
+_register_tool(task_status)
+_register_tool(task_list)
+_register_tool(task_kill)
+
+
+def health() -> str:
+    """Reports local Nomad MCP server process health."""
+    return success_result(
+        tool="health",
+        message="Nomad MCP server is running.",
+        data={
+            "pid": os.getpid(),
+            "uptime_seconds": round(time.time() - SERVER_START_TIME, 3),
+            "cwd": os.getcwd(),
+            "version": __version__,
+            "python": sys.version.replace("\n", " "),
+            "log_path": str(get_log_path()),
+        },
+    )
+
+
+_register_tool(health)
 
 
 @mcp_server.resource("config://current-project")
+@_safe_resource
 def get_current_project_resource() -> str:
     """Returns a sanitized summary of current project config and agent hints."""
     try:
@@ -108,6 +237,8 @@ def get_current_project_resource() -> str:
 
 def main():
     """Server CLI Entry."""
+    log_server_startup(os.getcwd(), __version__)
+    atexit.register(log_server_shutdown)
     mcp_server.run()
 
 

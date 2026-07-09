@@ -12,6 +12,7 @@ from typing import List, Dict, Any, Optional
 
 
 CONTROL_PATH = "/tmp/nomad_ssh_%C"
+CONTROLMASTER_ENV_VAR = "NOMAD_SSH_CONTROLMASTER"
 DEFAULT_CONNECT_TIMEOUT = 5
 HOST_SHELL_META_RE = re.compile(r"[;|&$\\<>`]")
 HOST_CONTROL_OR_SPACE_RE = re.compile(r"[\s\x00-\x1f\x7f]")
@@ -19,6 +20,42 @@ HOST_CONTROL_OR_SPACE_RE = re.compile(r"[\s\x00-\x1f\x7f]")
 
 class SshConfigError(Exception):
     """Raised when SSH argv cannot be built from the provided config."""
+
+
+def controlmaster_enabled() -> bool:
+    """Returns whether shared SSH ControlMaster sockets are enabled."""
+    import os
+
+    value = os.environ.get(CONTROLMASTER_ENV_VAR, "").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+def ssh_control_options() -> list[str]:
+    """Returns ssh -o options for ControlMaster behavior."""
+    if not controlmaster_enabled():
+        return [
+            "-o",
+            "ControlMaster=no",
+        ]
+    return [
+        "-o",
+        "ControlMaster=auto",
+        "-o",
+        f"ControlPath={CONTROL_PATH}",
+        "-o",
+        "ControlPersist=60s",
+    ]
+
+
+def build_rsync_ssh_command(
+    *, timeout: int = DEFAULT_CONNECT_TIMEOUT, jump_host: str | None = None
+) -> str:
+    """Builds the rsync -e ssh command using the same ControlMaster settings."""
+    parts = ["ssh", *ssh_control_options(), "-o", f"ConnectTimeout={timeout}", "-o", "BatchMode=yes"]
+    if jump_host:
+        _validate_host_like("jump_host", jump_host)
+        parts.extend(["-J", jump_host])
+    return " ".join(parts)
 
 
 def build_ssh_args(
@@ -38,12 +75,7 @@ def build_ssh_args(
 
     argv = [
         "ssh",
-        "-o",
-        "ControlMaster=auto",
-        "-o",
-        f"ControlPath={CONTROL_PATH}",
-        "-o",
-        "ControlPersist=60s",
+        *ssh_control_options(),
         "-o",
         f"ConnectTimeout={timeout}",
         "-o",
@@ -137,6 +169,12 @@ def probe_ssh_connectivity_result(
             error_type="ssh_timeout",
             diagnostics=[f"SSH probe timed out after {timeout} seconds."],
         )
+    except OSError as exc:
+        return _probe_result(
+            ok=False,
+            error_type="ssh_unknown_failure",
+            diagnostics=[f"Failed to launch ssh probe: {exc}"],
+        )
 
     if completed.returncode == 0:
         return _probe_result(ok=True, diagnostics=["SSH probe succeeded."])
@@ -185,12 +223,15 @@ def execute_remote_cmd_sync(
     Returns (returncode, stdout, stderr).
     """
     argv = build_ssh_args(ssh_host, timeout=timeout, jump_host=jump_host) + [cmd]
-    completed = subprocess.run(
-        argv,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-    )
+    try:
+        completed = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except OSError as exc:
+        return 255, "", f"Failed to launch ssh: {exc}"
     return completed.returncode, completed.stdout, completed.stderr
 
 
@@ -260,6 +301,3 @@ def build_tunnel_start_args(
         argv.extend(["-J", jump_host])
     argv.append(ssh_host)
     return argv
-
-
-
