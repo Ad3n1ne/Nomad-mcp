@@ -27,6 +27,19 @@ def test_cli_client_config_uvx_json(capsys):
     assert config == {"command": "uvx", "args": ["nomad-mcp"]}
 
 
+def test_cli_client_config_github_json(capsys):
+    assert main(["client-config", "--runner", "github"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    config = payload["mcpServers"]["nomad"]
+    assert config["command"] == "uvx"
+    assert config["args"] == [
+        "--from",
+        f"git+https://github.com/Ad3n1ne/Nomad-mcp.git@v{__version__}",
+        "nomad",
+    ]
+
+
 def test_cli_client_config_installed_toml(capsys):
     assert main(["client-config", "--runner", "nomad", "--format", "toml"]) == 0
 

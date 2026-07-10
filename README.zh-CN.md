@@ -28,10 +28,16 @@ nomad 是一个运行在本地的 MCP Server，用来打通“本地写代码 + 
 
 ## 安装
 
-推荐用 `uvx` 直接运行：
+使用 PyPI 最新版本时，可以用 `uvx` 直接运行：
 
 ```bash
 uvx nomad-mcp
+```
+
+如果想直接使用指定 GitHub tag，不等 PyPI 同步：
+
+```bash
+uvx --from git+https://github.com/Ad3n1ne/Nomad-mcp.git@v0.1.1 nomad
 ```
 
 或者用 `pipx` 安装成隔离的全局命令：
@@ -44,7 +50,7 @@ pipx install nomad-mcp
 
 不同 MCP 客户端的配置文件位置不同。
 
-推荐的免安装配置：
+推荐的 PyPI 免安装配置：
 
 ```json
 {
@@ -52,6 +58,23 @@ pipx install nomad-mcp
     "nomad": {
       "command": "uvx",
       "args": ["nomad-mcp"]
+    }
+  }
+}
+```
+
+如果想直接使用 GitHub 最新 tag：
+
+```json
+{
+  "mcpServers": {
+    "nomad": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/Ad3n1ne/Nomad-mcp.git@v0.1.1",
+        "nomad"
+      ]
     }
   }
 }
@@ -83,6 +106,7 @@ startup_timeout_sec = 120
 
 ```bash
 nomad client-config
+nomad client-config --runner github
 nomad client-config --runner nomad --format toml
 ```
 

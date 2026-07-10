@@ -14,6 +14,7 @@ from nomad.schema import get_config_schema_hints
 
 
 PACKAGE_NAME = "nomad-mcp"
+GITHUB_PACKAGE_URL = "git+https://github.com/Ad3n1ne/Nomad-mcp.git"
 
 
 def main(argv: list[str] | None = None) -> int | None:
@@ -61,9 +62,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     config_parser.add_argument(
         "--runner",
-        choices=("uvx", "nomad"),
+        choices=("uvx", "github", "nomad"),
         default="uvx",
-        help="Use uvx package execution or an already-installed nomad command.",
+        help="Use PyPI uvx, GitHub-tag uvx, or an already-installed nomad command.",
     )
     config_parser.add_argument(
         "--format",
@@ -94,6 +95,9 @@ def _client_config(runner: str, output_format: str) -> str:
     if runner == "uvx":
         command = "uvx"
         args = [PACKAGE_NAME]
+    elif runner == "github":
+        command = "uvx"
+        args = ["--from", f"{GITHUB_PACKAGE_URL}@v{__version__}", "nomad"]
     else:
         command = "nomad"
         args = []

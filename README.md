@@ -34,13 +34,19 @@ and arguments can use nomad.
 
 ## Installation
 
-Run directly with `uvx`:
+Run the latest PyPI release directly with `uvx`:
 
 ```bash
 uvx nomad-mcp
 ```
 
-Or install it as an isolated global command with `pipx`:
+Run a specific GitHub tag without waiting for PyPI propagation:
+
+```bash
+uvx --from git+https://github.com/Ad3n1ne/Nomad-mcp.git@v0.1.1 nomad
+```
+
+Or install a release as an isolated global command with `pipx`:
 
 ```bash
 pipx install nomad-mcp
@@ -50,7 +56,7 @@ pipx install nomad-mcp
 
 Use nomad as a stdio MCP server. The exact config file depends on your client.
 
-Recommended no-install configuration:
+Recommended PyPI no-install configuration:
 
 ```json
 {
@@ -58,6 +64,23 @@ Recommended no-install configuration:
     "nomad": {
       "command": "uvx",
       "args": ["nomad-mcp"]
+    }
+  }
+}
+```
+
+For the latest GitHub tag:
+
+```json
+{
+  "mcpServers": {
+    "nomad": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/Ad3n1ne/Nomad-mcp.git@v0.1.1",
+        "nomad"
+      ]
     }
   }
 }
@@ -89,6 +112,7 @@ You can also print config snippets with:
 
 ```bash
 nomad client-config
+nomad client-config --runner github
 nomad client-config --runner nomad --format toml
 ```
 
