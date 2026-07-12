@@ -119,13 +119,14 @@ nomad client-config --runner nomad --format toml
 ## Quick Start
 
 1. Open an MCP-enabled agent in your local project directory.
-2. Ask it to call `init_discover`.
-3. Choose an SSH target and remote workspace path.
-4. Ask it to save a `.nomad.json` config with `init_save_config`.
-5. Push code with `sync_push`.
-6. Run short commands with `run_remote`.
-7. Run long jobs with `task_start`, then monitor them with `task_status` or `task_list`.
-8. Pull remote artifacts with `sync_pull`.
+2. Ask it to call `health` before the first Nomad tool use.
+3. Ask it to call `init_discover`.
+4. Choose an SSH target and remote workspace path.
+5. Ask it to save a `.nomad.json` config with `init_save_config`.
+6. Push code with `sync_push`.
+7. Run short commands with `run_remote`.
+8. Run long jobs with `task_start`, then monitor them with `task_status` or `task_list`.
+9. Pull remote artifacts with `sync_pull`.
 
 ## Example `.nomad.json`
 
@@ -171,6 +172,19 @@ nomad client-config --runner nomad --format toml
 training, fuzzing, and other slow work, prefer `task_start` so the job runs in a
 remote tmux session and can be checked later.
 
+## Codex Usage Guardrails
+
+- Call `health` before the first Nomad tool call in each Codex task.
+- Use `run_remote` only for short synchronous probes and commands.
+- Use `task_start` for uploads, builds, training, servers, scans, or batch work.
+- If the outer client reports `Transport closed`, stop retrying Nomad tools in
+  that task and restart the MCP transport.
+- To clear stale Codex-spawned Nomad MCP processes locally, run:
+
+```bash
+nomad doctor --kill-stale-mcp
+```
+
 ## Tools
 
 - `init_discover`: inspect the local workspace, SSH aliases, and proxy settings.
@@ -203,6 +217,7 @@ turn an untrusted agent or remote machine into a trusted one.
 python -m pip install -e .[dev]
 nomad --version
 nomad doctor
+nomad doctor --kill-stale-mcp --dry-run
 python -m pytest
 python -m compileall -q src tests
 ```

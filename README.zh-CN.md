@@ -113,13 +113,14 @@ nomad client-config --runner nomad --format toml
 ## 快速开始
 
 1. 在本地项目目录中打开支持 MCP 的智能体开发环境。
-2. 调用 `init_discover` 发现本地项目、SSH alias 和代理环境。
-3. 选择一个 SSH target 和远端工作目录。
-4. 调用 `init_save_config` 保存 `.nomad.json`。
-5. 使用 `sync_push` 把本地代码同步到远端。
-6. 使用 `run_remote` 执行短命令。
-7. 使用 `task_start` 启动长任务，再用 `task_status` 或 `task_list` 查看状态。
-8. 使用 `sync_pull` 拉取远端产物。
+2. 首次使用 Nomad 工具前先调用 `health`。
+3. 调用 `init_discover` 发现本地项目、SSH alias 和代理环境。
+4. 选择一个 SSH target 和远端工作目录。
+5. 调用 `init_save_config` 保存 `.nomad.json`。
+6. 使用 `sync_push` 把本地代码同步到远端。
+7. 使用 `run_remote` 执行短命令。
+8. 使用 `task_start` 启动长任务，再用 `task_status` 或 `task_list` 查看状态。
+9. 使用 `sync_pull` 拉取远端产物。
 
 ## 示例 `.nomad.json`
 
@@ -163,6 +164,18 @@ nomad client-config --runner nomad --format toml
 
 `run_remote` 的超时由 `limits.command_timeout_seconds` 控制。下载、编译、训练、Fuzzing、批处理这类慢任务更适合用 `task_start` 放到远端 tmux 后台运行。
 
+## Codex 调用约束
+
+- 每个 Codex task 首次调用 Nomad 前，先调用 `health`。
+- `run_remote` 只用于短同步探针和短命令。
+- 上传、编译、训练、服务进程、扫描、批处理统一用 `task_start`。
+- 如果 Codex 外层报 `Transport closed`，停止在当前 task 里反复重试 Nomad 工具，重启 MCP transport。
+- 本地清理 Codex 拉起后残留的 Nomad MCP 进程：
+
+```bash
+nomad doctor --kill-stale-mcp
+```
+
 ## 工具列表
 
 - `init_discover`：发现本地项目、SSH alias 和代理配置。
@@ -191,6 +204,7 @@ nomad 会通过 SSH 执行命令，也会使用 `rsync` 同步文件。请只在
 python -m pip install -e .[dev]
 nomad --version
 nomad doctor
+nomad doctor --kill-stale-mcp --dry-run
 python -m pytest
 python -m compileall -q src tests
 ```

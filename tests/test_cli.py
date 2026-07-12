@@ -1,4 +1,5 @@
 import json
+import subprocess
 
 from nomad import __version__
 from nomad.cli import main
@@ -57,3 +58,54 @@ def test_cli_doctor_success(monkeypatch, capsys):
     assert "python>=3.11" in out
     assert "ssh" in out
     assert "rsync" in out
+
+
+def test_cli_doctor_kill_stale_mcp(monkeypatch, capsys):
+    ps_output = "\n".join(
+        [
+            "100 1 /Applications/ChatGPT.app/Contents/Resources/codex app-server",
+            "101 100 /Users/me/miniconda3/bin/python /Users/me/miniconda3/bin/nomad",
+            "102 1 /Users/me/miniconda3/bin/python /Users/me/miniconda3/bin/nomad",
+            "103 100 /Users/me/miniconda3/bin/python /Users/me/miniconda3/bin/nomad doctor --kill-stale-mcp",
+        ]
+    )
+
+    def fake_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, returncode=0, stdout=ps_output, stderr="")
+
+    killed = []
+    monkeypatch.setattr("nomad.cli.shutil.which", lambda cmd: f"/usr/bin/{cmd}")
+    monkeypatch.setattr("nomad.cli.subprocess.run", fake_run)
+    monkeypatch.setattr("nomad.cli.os.getpid", lambda: 999)
+    monkeypatch.setattr("nomad.cli.os.kill", lambda pid, sig: killed.append((pid, sig)))
+
+    assert main(["doctor", "--kill-stale-mcp"]) == 0
+
+    out = capsys.readouterr().out
+    assert "killed pid=101" in out
+    assert "pid=102" not in out
+    assert "pid=103" not in out
+    assert killed == [(101, 15)]
+
+
+def test_cli_doctor_dry_run_stale_mcp(monkeypatch, capsys):
+    ps_output = "\n".join(
+        [
+            "200 1 /Applications/ChatGPT.app/Contents/Resources/codex app-server",
+            "201 200 /Users/me/miniconda3/bin/python /Users/me/miniconda3/bin/nomad",
+        ]
+    )
+
+    def fake_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, returncode=0, stdout=ps_output, stderr="")
+
+    killed = []
+    monkeypatch.setattr("nomad.cli.shutil.which", lambda cmd: f"/usr/bin/{cmd}")
+    monkeypatch.setattr("nomad.cli.subprocess.run", fake_run)
+    monkeypatch.setattr("nomad.cli.os.kill", lambda pid, sig: killed.append((pid, sig)))
+
+    assert main(["doctor", "--dry-run"]) == 0
+
+    out = capsys.readouterr().out
+    assert "would kill pid=201" in out
+    assert killed == []

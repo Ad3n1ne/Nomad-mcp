@@ -84,7 +84,11 @@ echo $? > {shlex.quote(exit_file)}
 
 
 def task_start(cmd: str, task_name: str, target: str = "default") -> str:
-    """Starts an asynchronous task under tmux on the remote host."""
+    """Starts a long-running remote command under tmux and returns immediately.
+
+    Prefer this over run_remote for uploads, builds, training, servers, scans, and
+    any command that may run longer than a short synchronous probe.
+    """
     try:
         config = load_config()
     except ConfigError as exc:

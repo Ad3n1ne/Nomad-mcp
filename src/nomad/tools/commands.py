@@ -34,7 +34,12 @@ from nomad.truncate import safe_truncate
 
 
 def run_remote(cmd: str, target: str = "default") -> str:
-    """Executes a command on the remote host workspace under target limits."""
+    """Runs a short synchronous command in the remote workspace.
+
+    Use this for quick probes and commands expected to finish within the configured
+    timeout. For uploads, builds, training, servers, scans, or other long work, use
+    task_start and then task_status/task_list instead.
+    """
     try:
         config = load_config()
     except ConfigError as exc:

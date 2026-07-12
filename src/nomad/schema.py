@@ -13,11 +13,12 @@ def get_config_schema_hints(project_name: str = "my_project") -> dict[str, Any]:
     return {
         "purpose": ".nomad.json binds one local project to one or more remote targets.",
         "recommended_init_flow": [
+            "Call health before the first Nomad tool call in a Codex task.",
             "Call init_discover to inspect local project markers, SSH aliases, and proxy env.",
             "Ask the user for ssh_host, remote_path, and optional local_subpath.",
             "Call init_verify_and_probe(ssh_host, remote_path) before saving when possible.",
             "Call init_save_config with a JSON string matching the template.",
-            "Call sync_push, then run_remote or task_start depending on command duration.",
+            "Call sync_push, then use run_remote only for short probes or task_start for long work.",
         ],
         "minimal_remote_template": _minimal_remote_template(project_name),
         "fields": {
@@ -56,8 +57,10 @@ def get_config_schema_hints(project_name: str = "my_project") -> dict[str, Any]:
             "limits.max_output_bytes": 10240,
         },
         "command_duration_guidance": {
-            "run_remote": "Use for short commands. Its timeout is limits.command_timeout_seconds.",
-            "task_start": "Use for long jobs. It starts tmux and returns immediately; monitor with task_status/task_list.",
+            "health": "Call before first Nomad use in a Codex task to verify MCP transport is alive.",
+            "run_remote": "Use only for short synchronous probes. Its timeout is limits.command_timeout_seconds.",
+            "task_start": "Use for long jobs, uploads, builds, training, servers, scans, and batch work. It starts tmux and returns immediately; monitor with task_status/task_list.",
+            "transport_closed": "If the outer client reports Transport closed, stop retrying Nomad tools in that task and restart the MCP transport.",
         },
     }
 

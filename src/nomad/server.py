@@ -41,7 +41,7 @@ from nomad.tools.tasks import task_kill, task_list, task_start, task_status
 
 SERVER_START_TIME = time.time()
 
-mcp_server = FastMCP("nomad")
+mcp_server = FastMCP("nomad", log_level="ERROR")
 
 
 def _safe_tool(func: Callable[..., str]) -> Callable[..., str]:
@@ -151,7 +151,7 @@ _register_tool(task_kill)
 
 
 def health() -> str:
-    """Reports local Nomad MCP server process health."""
+    """Reports local Nomad MCP server process health; call this before the first Nomad tool use in a Codex task."""
     return success_result(
         tool="health",
         message="Nomad MCP server is running.",
@@ -216,9 +216,11 @@ def get_current_project_resource() -> str:
         }
 
     hints = (
-        "In 'remote' mode, push code with 'sync_push' before 'run_remote'. "
-        "Use 'task_start' for long-running commands, 'task_status'/'task_list' to monitor them, "
+        "In 'remote' mode, call 'health' before the first Nomad tool use, then push code with 'sync_push'. "
+        "Use 'run_remote' only for short synchronous probes and commands expected to finish quickly. "
+        "Use 'task_start' for long-running commands, uploads, builds, training, or batch work; monitor them with 'task_status'/'task_list', "
         "and 'sync_pull' to retrieve remote artifacts. "
+        "If an outer client error says 'Transport closed', stop retrying Nomad tools in that Codex task and restart the MCP transport. "
         "If network issues or proxies are involved, use 'net_diagnose' and the tunnel tools."
         if mode == "remote"
         else "Project is in 'local' mode. All commands run locally; remote sync and tunnels are disabled."

@@ -5,7 +5,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
+import signal
+import subprocess
 import sys
 from importlib.util import find_spec
 
@@ -34,7 +37,7 @@ def main(argv: list[str] | None = None) -> int | None:
         return 0
 
     if args.command == "doctor":
-        return _doctor()
+        return _doctor(kill_stale_mcp=args.kill_stale_mcp, dry_run=args.dry_run)
     if args.command == "schema":
         print(json.dumps(get_config_schema_hints(), indent=2))
         return 0
@@ -54,7 +57,19 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="store_true", help="Print nomad version.")
 
     subparsers = parser.add_subparsers(dest="command")
-    subparsers.add_parser("doctor", help="Check local runtime dependencies.")
+    doctor_parser = subparsers.add_parser(
+        "doctor", help="Check local runtime dependencies and optional MCP recovery."
+    )
+    doctor_parser.add_argument(
+        "--kill-stale-mcp",
+        action="store_true",
+        help="Kill Nomad MCP processes spawned by Codex/ChatGPT so the client can reconnect.",
+    )
+    doctor_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show stale MCP processes without killing them.",
+    )
     subparsers.add_parser("schema", help="Print .nomad.json schema hints as JSON.")
 
     config_parser = subparsers.add_parser(
@@ -75,7 +90,7 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _doctor() -> int:
+def _doctor(*, kill_stale_mcp: bool = False, dry_run: bool = False) -> int:
     checks = [
         ("python>=3.11", sys.version_info >= (3, 11), sys.version.split()[0]),
         ("mcp package", find_spec("mcp") is not None, "import mcp"),
@@ -88,7 +103,85 @@ def _doctor() -> int:
         mark = "ok" if passed else "missing"
         print(f"{mark:7} {name}: {detail}")
     print("note    remote tmux is required only when using task_start/task_status.")
+    if kill_stale_mcp or dry_run:
+        stale = _find_stale_mcp_processes()
+        if not stale:
+            print("mcp     no stale Codex-spawned Nomad MCP processes found.")
+        for proc in stale:
+            if dry_run:
+                print(f"mcp     would kill pid={proc['pid']} ppid={proc['ppid']} command={proc['command']}")
+                continue
+            try:
+                os.kill(proc["pid"], signal.SIGTERM)
+            except ProcessLookupError:
+                print(f"mcp     already exited pid={proc['pid']}")
+            except PermissionError as exc:
+                ok = False
+                print(f"mcp     failed pid={proc['pid']}: {exc}")
+            else:
+                print(f"mcp     killed pid={proc['pid']} ppid={proc['ppid']}")
     return 0 if ok else 1
+
+
+def _find_stale_mcp_processes() -> list[dict[str, int | str]]:
+    """Finds Nomad MCP processes owned by Codex/ChatGPT, excluding this doctor run."""
+    try:
+        completed = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,command="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if completed.returncode != 0:
+        return []
+
+    rows: list[dict[str, int | str]] = []
+    commands_by_pid: dict[int, str] = {}
+    current_pid = os.getpid()
+    for line in completed.stdout.splitlines():
+        parts = line.strip().split(maxsplit=2)
+        if len(parts) < 3:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+        except ValueError:
+            continue
+        command = parts[2]
+        commands_by_pid[pid] = command
+        rows.append({"pid": pid, "ppid": ppid, "command": command})
+
+    stale: list[dict[str, int | str]] = []
+    for row in rows:
+        pid = int(row["pid"])
+        ppid = int(row["ppid"])
+        command = str(row["command"])
+        parent_command = commands_by_pid.get(ppid, "")
+        if pid == current_pid:
+            continue
+        if " doctor" in command or " --kill-stale-mcp" in command:
+            continue
+        if not _looks_like_nomad_mcp_command(command):
+            continue
+        if not _looks_like_codex_parent(parent_command):
+            continue
+        stale.append(row)
+    return stale
+
+
+def _looks_like_nomad_mcp_command(command: str) -> bool:
+    if "nomad" not in command:
+        return False
+    if "python" in command and "/nomad" in command:
+        return True
+    return command.endswith("/nomad") or command.endswith(" nomad") or command == "nomad"
+
+
+def _looks_like_codex_parent(command: str) -> bool:
+    lowered = command.lower()
+    return "codex" in lowered or "chatgpt.app" in lowered
 
 
 def _client_config(runner: str, output_format: str) -> str:
