@@ -44,6 +44,16 @@ def main(argv: list[str] | None = None) -> int | None:
     if args.command == "client-config":
         print(_client_config(args.runner, args.format))
         return 0
+    if args.command == "serve":
+        from nomad.server import main as server_main
+
+        server_main(
+            transport="streamable-http",
+            host=args.host,
+            port=args.port,
+            path=args.path,
+        )
+        return None
 
     parser.print_help()
     return 0
@@ -87,7 +97,44 @@ def _build_parser() -> argparse.ArgumentParser:
         default="json",
         help="Output config format.",
     )
+
+    serve_parser = subparsers.add_parser(
+        "serve", help="Run Nomad as a foreground Streamable HTTP MCP server."
+    )
+    serve_parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Listen host (default: 127.0.0.1).",
+    )
+    serve_parser.add_argument(
+        "--port",
+        type=_valid_port,
+        default=8765,
+        help="Listen port from 1 to 65535 (default: 8765).",
+    )
+    serve_parser.add_argument(
+        "--path",
+        type=_valid_path,
+        default="/mcp",
+        help="Streamable HTTP endpoint path (default: /mcp).",
+    )
     return parser
+
+
+def _valid_port(value: str) -> int:
+    try:
+        port = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("port must be an integer") from exc
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("port must be between 1 and 65535")
+    return port
+
+
+def _valid_path(value: str) -> str:
+    if not value.startswith("/"):
+        raise argparse.ArgumentTypeError("path must start with '/'")
+    return value
 
 
 def _doctor(*, kill_stale_mcp: bool = False, dry_run: bool = False) -> int:

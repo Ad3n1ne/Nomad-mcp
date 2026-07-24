@@ -1,6 +1,20 @@
 import json
 import os
-from nomad.server import _safe_resource, _safe_tool, health, mcp_server, get_current_project_resource
+import pytest
+
+from nomad.server import (
+    DEFAULT_HOST,
+    DEFAULT_PATH,
+    DEFAULT_PORT,
+    _safe_resource,
+    _safe_tool,
+    create_server,
+    get_current_project_resource,
+    health,
+    log_server_shutdown,
+    main,
+    mcp_server,
+)
 
 
 def test_server_tools_registered():
@@ -27,6 +41,100 @@ def test_server_tools_registered():
     }
     assert expected_phase1_tools.issubset(registered_tools)
     assert expected_phase2_tools.issubset(registered_tools)
+
+
+def test_create_server_configures_http_and_preserves_registrations():
+    server = create_server(host="localhost", port=9876, path="/nomad")
+
+    assert server.settings.host == "localhost"
+    assert server.settings.port == 9876
+    assert server.settings.streamable_http_path == "/nomad"
+    assert set(server._tool_manager._tools) == set(mcp_server._tool_manager._tools)
+    assert set(server._resource_manager._resources) == set(mcp_server._resource_manager._resources)
+
+
+@pytest.mark.parametrize("port", [0, 65536, -1, True, "8765"])
+def test_create_server_rejects_invalid_port(port):
+    with pytest.raises(ValueError, match="port"):
+        create_server(port=port)
+
+
+@pytest.mark.parametrize("path", ["mcp", "", 123])
+def test_create_server_rejects_invalid_path(path):
+    with pytest.raises(ValueError, match="path"):
+        create_server(path=path)
+
+
+def test_server_main_defaults_to_stdio(monkeypatch):
+    calls = {}
+
+    class FakeServer:
+        def run(self, *, transport):
+            calls["transport"] = transport
+
+    def fake_create_server(*, host, port, path):
+        calls["config"] = (host, port, path)
+        return FakeServer()
+
+    monkeypatch.setattr("nomad.server.create_server", fake_create_server)
+    monkeypatch.setattr("nomad.server.log_server_startup", lambda *_: None)
+    monkeypatch.setattr("nomad.server.atexit.register", lambda *_: None)
+
+    main()
+
+    assert calls == {
+        "config": (DEFAULT_HOST, DEFAULT_PORT, DEFAULT_PATH),
+        "transport": "stdio",
+    }
+
+
+def test_server_main_accepts_explicit_transport_and_http_options(monkeypatch):
+    calls = {}
+
+    class FakeServer:
+        def run(self, *, transport):
+            calls["transport"] = transport
+
+    def fake_create_server(*, host, port, path):
+        calls["config"] = (host, port, path)
+        return FakeServer()
+
+    monkeypatch.setattr("nomad.server.create_server", fake_create_server)
+    monkeypatch.setattr("nomad.server.log_server_startup", lambda *_: None)
+    monkeypatch.setattr("nomad.server.atexit.register", lambda *_: None)
+
+    main(
+        transport="streamable-http",
+        host="localhost",
+        port=9999,
+        path="/custom",
+    )
+
+    assert calls == {
+        "config": ("localhost", 9999, "/custom"),
+        "transport": "streamable-http",
+    }
+
+
+def test_server_main_handles_keyboard_interrupt_and_keeps_shutdown_hook(monkeypatch):
+    registered = []
+
+    class InterruptedServer:
+        def run(self, *, transport):
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        "nomad.server.create_server",
+        lambda **_: InterruptedServer(),
+    )
+    monkeypatch.setattr("nomad.server.log_server_startup", lambda *_: None)
+    monkeypatch.setattr(
+        "nomad.server.atexit.register",
+        lambda callback: registered.append(callback),
+    )
+
+    assert main(transport="streamable-http") is None
+    assert registered == [log_server_shutdown]
 
 
 def test_health_returns_process_metadata(tmp_path, monkeypatch):

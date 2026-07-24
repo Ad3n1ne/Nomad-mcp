@@ -1,6 +1,8 @@
 import json
 import subprocess
 
+import pytest
+
 from nomad import __version__
 from nomad.cli import main
 
@@ -47,6 +49,57 @@ def test_cli_client_config_installed_toml(capsys):
     out = capsys.readouterr().out
     assert 'command = "nomad"' in out
     assert "args = []" in out
+
+
+def test_cli_serve_uses_streamable_http_defaults(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "nomad.server.main",
+        lambda **kwargs: calls.append(kwargs),
+    )
+
+    assert main(["serve"]) is None
+
+    assert calls == [
+        {
+            "transport": "streamable-http",
+            "host": "127.0.0.1",
+            "port": 8765,
+            "path": "/mcp",
+        }
+    ]
+
+
+def test_cli_serve_passes_explicit_http_options(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "nomad.server.main",
+        lambda **kwargs: calls.append(kwargs),
+    )
+
+    assert main(
+        ["serve", "--host", "localhost", "--port", "9999", "--path", "/nomad"]
+    ) is None
+
+    assert calls == [
+        {
+            "transport": "streamable-http",
+            "host": "localhost",
+            "port": 9999,
+            "path": "/nomad",
+        }
+    ]
+
+
+@pytest.mark.parametrize("port", ["0", "65536", "invalid"])
+def test_cli_serve_rejects_invalid_port(port):
+    with pytest.raises(SystemExit):
+        main(["serve", "--port", port])
+
+
+def test_cli_serve_rejects_path_without_leading_slash():
+    with pytest.raises(SystemExit):
+        main(["serve", "--path", "mcp"])
 
 
 def test_cli_doctor_success(monkeypatch, capsys):

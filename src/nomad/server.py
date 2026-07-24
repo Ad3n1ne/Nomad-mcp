@@ -10,7 +10,7 @@ import json
 import os
 import sys
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 from mcp.server.fastmcp import FastMCP
 
@@ -40,8 +40,10 @@ from nomad.tools.sync import sync_pull, sync_push
 from nomad.tools.tasks import task_kill, task_list, task_start, task_status
 
 SERVER_START_TIME = time.time()
-
-mcp_server = FastMCP("nomad", log_level="ERROR")
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 8765
+DEFAULT_PATH = "/mcp"
+Transport = Literal["stdio", "sse", "streamable-http"]
 
 
 def _safe_tool(func: Callable[..., str]) -> Callable[..., str]:
@@ -126,30 +128,6 @@ def _safe_resource(func: Callable[..., str]) -> Callable[..., str]:
     return wrapper
 
 
-def _register_tool(func: Callable[..., str]) -> None:
-    mcp_server.tool()(_safe_tool(func))
-
-
-# Register Phase 1 Tools
-_register_tool(init_discover)
-_register_tool(init_verify_and_probe)
-_register_tool(init_save_config)
-_register_tool(init_probe_target)
-_register_tool(sync_push)
-_register_tool(sync_pull)
-_register_tool(run_remote)
-_register_tool(tunnel_start)
-_register_tool(tunnel_status)
-_register_tool(tunnel_stop)
-_register_tool(net_diagnose)
-
-# Register Phase 2 Tools
-_register_tool(task_start)
-_register_tool(task_status)
-_register_tool(task_list)
-_register_tool(task_kill)
-
-
 def health() -> str:
     """Reports local Nomad MCP server process health; call this before the first Nomad tool use in a Codex task."""
     return success_result(
@@ -165,11 +143,6 @@ def health() -> str:
         },
     )
 
-
-_register_tool(health)
-
-
-@mcp_server.resource("config://current-project")
 @_safe_resource
 def get_current_project_resource() -> str:
     """Returns a sanitized summary of current project config and agent hints."""
@@ -237,11 +210,68 @@ def get_current_project_resource() -> str:
     return json.dumps(payload, indent=2)
 
 
-def main():
+TOOLS: tuple[Callable[..., str], ...] = (
+    init_discover,
+    init_verify_and_probe,
+    init_save_config,
+    init_probe_target,
+    sync_push,
+    sync_pull,
+    run_remote,
+    tunnel_start,
+    tunnel_status,
+    tunnel_stop,
+    net_diagnose,
+    task_start,
+    task_status,
+    task_list,
+    task_kill,
+    health,
+)
+
+
+def create_server(
+    *,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+    path: str = DEFAULT_PATH,
+) -> FastMCP:
+    """Creates a fully registered Nomad MCP server."""
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise ValueError("port must be an integer between 1 and 65535")
+    if not isinstance(path, str) or not path.startswith("/"):
+        raise ValueError("path must start with '/'")
+
+    server = FastMCP(
+        "nomad",
+        log_level="ERROR",
+        host=host,
+        port=port,
+        streamable_http_path=path,
+    )
+    for tool in TOOLS:
+        server.tool()(_safe_tool(tool))
+    server.resource("config://current-project")(get_current_project_resource)
+    return server
+
+
+mcp_server = create_server()
+
+
+def main(
+    transport: Transport = "stdio",
+    *,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+    path: str = DEFAULT_PATH,
+) -> None:
     """Server CLI Entry."""
     log_server_startup(os.getcwd(), __version__)
     atexit.register(log_server_shutdown)
-    mcp_server.run()
+    try:
+        create_server(host=host, port=port, path=path).run(transport=transport)
+    except KeyboardInterrupt:
+        return
 
 
 if __name__ == "__main__":
