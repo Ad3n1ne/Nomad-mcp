@@ -46,13 +46,23 @@ def main(argv: list[str] | None = None) -> int | None:
     if args.command == "client-config":
         return _run_client_config(args)
     if args.command == "serve":
-        from nomad.server import is_loopback_host, main as server_main
+        from nomad.daemon import DaemonError, claim_daemon_state, is_loopback_host
 
         if not is_loopback_host(args.host):
             parser.error(
                 "serve only supports loopback hosts in Nomad 0.2.0; "
                 "remote binding requires a future TLS-enabled release"
             )
+        if bool(args.daemon_id) != bool(args.daemon_state):
+            parser.error("--daemon-id and --daemon-state must be provided together")
+        if args.daemon_state:
+            try:
+                claim_daemon_state(args.daemon_state, args.daemon_id)
+            except DaemonError as exc:
+                parser.error(f"cannot claim daemon lifecycle state: {exc}")
+
+        from nomad.server import main as server_main
+
         bearer_token = os.environ.get("NOMAD_MCP_BEARER_TOKEN") or None
 
         server_main(
@@ -146,6 +156,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Streamable HTTP endpoint path (default: /mcp).",
     )
     serve_parser.add_argument("--daemon-id", help=argparse.SUPPRESS)
+    serve_parser.add_argument("--daemon-state", help=argparse.SUPPRESS)
 
     daemon_parser = subparsers.add_parser(
         "daemon", help="Manage a persistent project-scoped Nomad MCP server."

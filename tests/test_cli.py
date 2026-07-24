@@ -235,6 +235,79 @@ def test_cli_serve_passes_explicit_http_options(monkeypatch):
     ]
 
 
+def test_cli_serve_claims_daemon_state_before_starting_server(monkeypatch):
+    calls = []
+    monkeypatch.setenv("NOMAD_MCP_BEARER_TOKEN", "environment-secret")
+    monkeypatch.setattr(
+        daemon,
+        "claim_daemon_state",
+        lambda state_path, instance_id: calls.append(
+            ("claim", state_path, instance_id)
+        ),
+    )
+    monkeypatch.setattr(
+        "nomad.server.main",
+        lambda **kwargs: calls.append(("server", kwargs)),
+    )
+
+    assert main(
+        [
+            "serve",
+            "--daemon-id",
+            "internal-instance",
+            "--daemon-state",
+            "/tmp/internal-state.json",
+        ]
+    ) is None
+
+    assert calls[0] == (
+        "claim",
+        "/tmp/internal-state.json",
+        "internal-instance",
+    )
+    assert calls[1][0] == "server"
+
+
+@pytest.mark.parametrize(
+    "hidden_args",
+    [
+        ["--daemon-id", "internal-instance"],
+        ["--daemon-state", "/tmp/internal-state.json"],
+    ],
+)
+def test_cli_serve_requires_complete_daemon_claim_arguments(hidden_args):
+    with pytest.raises(SystemExit):
+        main(["serve", *hidden_args])
+
+
+def test_cli_serve_rejects_failed_daemon_claim(monkeypatch):
+    monkeypatch.setattr(
+        daemon,
+        "claim_daemon_state",
+        lambda *args: (_ for _ in ()).throw(
+            daemon.DaemonError("instance mismatch")
+        ),
+    )
+    server_calls = []
+    monkeypatch.setattr(
+        "nomad.server.main",
+        lambda **kwargs: server_calls.append(kwargs),
+    )
+
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "serve",
+                "--daemon-id",
+                "internal-instance",
+                "--daemon-state",
+                "/tmp/internal-state.json",
+            ]
+        )
+
+    assert server_calls == []
+
+
 def test_cli_serve_rejects_remote_even_with_token(monkeypatch):
     monkeypatch.setenv("NOMAD_MCP_BEARER_TOKEN", "environment-secret")
 

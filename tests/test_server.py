@@ -244,6 +244,7 @@ def test_safe_tool_redacts_sensitive_exception_and_traceback(tmp_path, monkeypat
         "PASSWORD": "password-value",
         "AWS_SECRET_ACCESS_KEY": "aws-secret-value",
         "API_KEY": "api-key-value",
+        "SSH_PRIVATE_KEY": "ssh-private-key-value",
         "AUTH": "auth-value",
         "CREDENTIAL": "credential-value",
     }
@@ -259,6 +260,31 @@ def test_safe_tool_redacts_sensitive_exception_and_traceback(tmp_path, monkeypat
     assert all(secret not in result["diagnostics"][0] for secret in secrets.values())
     assert "API_TOKEN=[REDACTED]" in log_content
     assert "AWS_SECRET_ACCESS_KEY=[REDACTED]" in log_content
+
+
+def test_safe_tool_redacts_multiline_pem_private_key_traceback(
+    tmp_path, monkeypatch
+):
+    log_path = tmp_path / "nomad-mcp.log"
+    monkeypatch.setenv("NOMAD_MCP_LOG_PATH", str(log_path))
+    private_body = "traceback-private-line-one\ntraceback-private-line-two"
+    pem = (
+        "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+        f"{private_body}\n"
+        "-----END OPENSSH PRIVATE KEY-----"
+    )
+
+    def boom() -> str:
+        raise RuntimeError(f"SSH_PRIVATE_KEY={pem}")
+
+    result = json.loads(run_async(_safe_tool(boom)))
+
+    log_content = log_path.read_text(encoding="utf-8")
+    diagnostics = "\n".join(result["diagnostics"])
+    assert private_body not in log_content
+    assert private_body not in diagnostics
+    assert "[REDACTED]" in log_content
+    assert "[REDACTED]" in diagnostics
 
 
 def test_safe_tool_redacts_sensitive_params_from_log(tmp_path, monkeypatch):

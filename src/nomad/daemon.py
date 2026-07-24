@@ -39,6 +39,7 @@ PROJECT_PORT_MIN = 49152
 PROJECT_PORT_MAX = 65535
 BEARER_TOKEN_ENV_VAR = "NOMAD_MCP_BEARER_TOKEN"
 START_TIMEOUT_SECONDS = 10.0
+LAUNCH_CLAIM_TIMEOUT_SECONDS = 2.0
 STARTING_RECOVERY_TIMEOUT_SECONDS = 2.0
 STOP_TIMEOUT_SECONDS = 5.0
 POLL_INTERVAL_SECONDS = 0.1
@@ -96,6 +97,11 @@ def status_daemon(
         state = _read_state(paths["state"], project_root)
         if state is None:
             return _stopped_result(project_root)
+
+        if state.get("lifecycle") == "launching":
+            state = _recover_launching_state(state, paths, project_root)
+            if state is None:
+                return _stopped_result(project_root, stale_state_removed=True)
 
         pid = int(state["pid"])
         if not _pid_is_alive(pid):
@@ -184,6 +190,38 @@ def resolve_project(project: str | os.PathLike[str] | None = None) -> Path:
     return resolved
 
 
+def claim_daemon_state(
+    state_path: str | os.PathLike[str],
+    instance_id: str,
+) -> dict[str, Any]:
+    """Claims a parent-created launching state from the daemon child process."""
+    if not isinstance(instance_id, str) or not instance_id.strip():
+        raise DaemonError("daemon instance id is invalid")
+
+    project_root = resolve_project()
+    paths = _project_paths(project_root)
+    expected_path = paths["state"]
+    raw_state_path = Path(state_path).expanduser()
+    if not raw_state_path.is_absolute():
+        raise DaemonError("daemon state path must be absolute")
+    supplied_path = Path(os.path.abspath(os.fspath(raw_state_path)))
+    if supplied_path != expected_path:
+        raise DaemonError("daemon state path does not match the current project")
+
+    with _project_lock(paths["claim_lock"]):
+        state = _read_claimable_state(expected_path, project_root)
+        if state.get("instance_id") != instance_id:
+            raise DaemonError("daemon state instance id does not match")
+        if state.get("lifecycle") != "launching" or state.get("pid") != 0:
+            raise DaemonError("daemon state is not claimable")
+
+        claimed = dict(state)
+        claimed["pid"] = os.getpid()
+        claimed["lifecycle"] = "starting"
+        _write_state(expected_path, claimed)
+        return claimed
+
+
 def project_default_port(project: str | os.PathLike[str] | Path) -> int:
     """Maps a resolved project path to a stable private-use high port."""
     project_root = Path(project).expanduser().resolve(strict=True)
@@ -230,15 +268,18 @@ def _start_locked(
         )
     existing = _read_state(paths["state"], project_root)
     if existing is not None:
-        pid = int(existing["pid"])
-        if _pid_is_alive(pid) and _process_owns_instance(
-            pid, str(existing["instance_id"])
-        ):
-            existing = _recover_starting_state(existing, paths)
-            if existing.get("lifecycle", "running") == "running":
-                _write_port_profile(paths["port"], int(existing["port"]))
-            return _state_result(existing, already_running=True)
-        _remove_state(paths["state"])
+        if existing.get("lifecycle") == "launching":
+            existing = _recover_launching_state(existing, paths, project_root)
+        if existing is not None:
+            pid = int(existing["pid"])
+            if _pid_is_alive(pid) and _process_owns_instance(
+                pid, str(existing["instance_id"])
+            ):
+                existing = _recover_starting_state(existing, paths)
+                if existing.get("lifecycle", "running") == "running":
+                    _write_port_profile(paths["port"], int(existing["port"]))
+                return _state_result(existing, already_running=True)
+            _remove_state(paths["state"])
 
     with _port_allocation_lock():
         selected_port = _select_start_port(
@@ -282,47 +323,56 @@ def _launch_daemon_locked(
         path,
         "--daemon-id",
         instance_id,
+        "--daemon-state",
+        str(paths["state"]),
     ]
-    env = os.environ.copy()
-    env["NOMAD_MCP_LOG_PATH"] = str(paths["log"])
-    bearer_token = _read_or_create_token(paths["token"])
-    env[BEARER_TOKEN_ENV_VAR] = bearer_token
-
-    log_handle = _open_secure_append(paths["log"])
+    state = {
+        "schema_version": SCHEMA_VERSION,
+        "pid": 0,
+        "project_root": str(project_root),
+        "host": host,
+        "port": port,
+        "path": path,
+        "url": _build_url(host, port, path),
+        "version": __version__,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "instance_id": instance_id,
+        "log_path": str(paths["log"]),
+        "allow_remote": False,
+        "auth": True,
+        "token_env_var": _project_token_env_var(project_root),
+        "lifecycle": "launching",
+    }
+    process: subprocess.Popen[bytes] | None = None
     try:
-        process = subprocess.Popen(
-            command,
-            cwd=project_root,
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=log_handle,
-            stderr=log_handle,
-            start_new_session=True,
-        )
-    except OSError as exc:
-        raise DaemonError(f"failed to launch Nomad daemon: {exc}") from exc
-    finally:
-        log_handle.close()
-
-    try:
-        state = {
-            "schema_version": SCHEMA_VERSION,
-            "pid": process.pid,
-            "project_root": str(project_root),
-            "host": host,
-            "port": port,
-            "path": path,
-            "url": _build_url(host, port, path),
-            "version": __version__,
-            "started_at": datetime.now(timezone.utc).isoformat(),
-            "instance_id": instance_id,
-            "log_path": str(paths["log"]),
-            "allow_remote": False,
-            "auth": True,
-            "token_env_var": _project_token_env_var(project_root),
-            "lifecycle": "starting",
-        }
         _write_state(paths["state"], state)
+        env = os.environ.copy()
+        env["NOMAD_MCP_LOG_PATH"] = str(paths["log"])
+        bearer_token = _read_or_create_token(paths["token"])
+        env[BEARER_TOKEN_ENV_VAR] = bearer_token
+
+        log_handle = _open_secure_append(paths["log"])
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=project_root,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=log_handle,
+                stderr=log_handle,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            raise DaemonError(f"failed to launch Nomad daemon: {exc}") from exc
+        finally:
+            log_handle.close()
+
+        state = _wait_for_child_claim(
+            process,
+            paths,
+            project_root,
+            instance_id,
+        )
         _wait_until_ready(
             process,
             probe_host,
@@ -332,12 +382,21 @@ def _launch_daemon_locked(
         )
         if not _process_owns_instance(process.pid, instance_id):
             raise DaemonError("started process failed daemon ownership verification")
+        state = _read_state(paths["state"], project_root)
+        if (
+            state is None
+            or state.get("instance_id") != instance_id
+            or state.get("lifecycle") != "starting"
+            or state.get("pid") != process.pid
+        ):
+            raise DaemonError("daemon lifecycle state changed during startup")
         state["lifecycle"] = "running"
         state["ready_at"] = datetime.now(timezone.utc).isoformat()
         _write_port_profile(paths["port"], port)
         _write_state(paths["state"], state)
     except BaseException:
-        _terminate_failed_start(process)
+        if process is not None:
+            _terminate_failed_start(process)
         _remove_state(paths["state"])
         raise
 
@@ -353,6 +412,15 @@ def _stop_locked(
     state = _read_state(paths["state"], project_root)
     if state is None:
         return _stopped_result(project_root, already_stopped=True)
+
+    if state.get("lifecycle") == "launching":
+        state = _recover_launching_state(state, paths, project_root)
+        if state is None:
+            return _stopped_result(
+                project_root,
+                already_stopped=True,
+                stale_state_removed=True,
+            )
 
     pid = int(state["pid"])
     if not _pid_is_alive(pid):
@@ -405,6 +473,7 @@ def _project_paths(project_root: Path) -> dict[str, Path]:
     return {
         "state": daemon_dir / f"{project_hash}.json",
         "lock": daemon_dir / f"{project_hash}.lock",
+        "claim_lock": daemon_dir / f"{project_hash}.claim.lock",
         "log": daemon_dir / f"{project_hash}.log",
         "token": daemon_dir / f"{project_hash}.token",
         "port": daemon_dir / f"{project_hash}.port",
@@ -651,6 +720,31 @@ def _read_state(path: Path, project_root: Path) -> dict[str, Any] | None:
     return payload
 
 
+def _read_claimable_state(path: Path, project_root: Path) -> dict[str, Any]:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise DaemonError("cannot read daemon lifecycle state") from exc
+
+    try:
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            metadata = os.fstat(handle.fileno())
+            if not stat.S_ISREG(metadata.st_mode):
+                raise DaemonError("daemon lifecycle state is not a regular file")
+            payload = json.load(handle)
+    except DaemonError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise DaemonError("cannot read daemon lifecycle state") from exc
+
+    if not _valid_state(payload, project_root):
+        raise DaemonError("daemon lifecycle state is invalid")
+    return payload
+
+
 def _valid_state(payload: Any, project_root: Path) -> bool:
     if not isinstance(payload, dict):
         return False
@@ -679,7 +773,13 @@ def _valid_state(payload: Any, project_root: Path) -> bool:
         for key, expected_type in required_types.items()
     ):
         return False
-    if payload["pid"] <= 0:
+    lifecycle = payload.get("lifecycle", "running")
+    if lifecycle not in {"launching", "starting", "running"}:
+        return False
+    if lifecycle == "launching":
+        if payload["pid"] != 0:
+            return False
+    elif payload["pid"] <= 0:
         return False
     if not 1 <= payload["port"] <= 65535:
         return False
@@ -697,8 +797,6 @@ def _valid_state(payload: Any, project_root: Path) -> bool:
             payload[optional_key], expected_type
         ):
             return False
-    if payload.get("lifecycle", "running") not in {"starting", "running"}:
-        return False
     return True
 
 
@@ -735,6 +833,79 @@ def _recover_starting_state(
     _write_port_profile(paths["port"], int(recovered["port"]))
     _write_state(paths["state"], recovered)
     return recovered
+
+
+def _recover_launching_state(
+    state: Mapping[str, Any],
+    paths: Mapping[str, Path],
+    project_root: Path,
+    *,
+    timeout: float | None = None,
+) -> dict[str, Any] | None:
+    current = dict(state)
+    if current.get("lifecycle") != "launching":
+        return current
+
+    if timeout is None:
+        timeout = LAUNCH_CLAIM_TIMEOUT_SECONDS
+    instance_id = str(current["instance_id"])
+    deadline = time.monotonic() + max(0.0, timeout)
+    while time.monotonic() < deadline:
+        current = _read_state(paths["state"], project_root)
+        if current is None:
+            return None
+        if current.get("instance_id") != instance_id:
+            return current
+        if current.get("lifecycle") != "launching":
+            return current
+        time.sleep(POLL_INTERVAL_SECONDS)
+
+    with _project_lock(paths["claim_lock"]):
+        current = _read_state(paths["state"], project_root)
+        if current is None:
+            return None
+        if (
+            current.get("instance_id") == instance_id
+            and current.get("lifecycle") == "launching"
+            and current.get("pid") == 0
+        ):
+            _remove_state(paths["state"])
+            return None
+        return current
+
+
+def _wait_for_child_claim(
+    process: subprocess.Popen[bytes],
+    paths: Mapping[str, Path],
+    project_root: Path,
+    instance_id: str,
+    timeout: float | None = None,
+) -> dict[str, Any]:
+    if timeout is None:
+        timeout = START_TIMEOUT_SECONDS
+    deadline = time.monotonic() + max(0.0, timeout)
+    while time.monotonic() < deadline:
+        returncode = process.poll()
+        if returncode is not None:
+            raise DaemonError(
+                f"Nomad daemon exited before claiming lifecycle state with status {returncode}"
+            )
+        state = _read_state(paths["state"], project_root)
+        if state is None:
+            raise DaemonError("daemon lifecycle state disappeared before child claim")
+        if state.get("instance_id") != instance_id:
+            raise DaemonError("daemon lifecycle state instance changed before child claim")
+        if (
+            state.get("lifecycle") == "starting"
+            and state.get("pid") == process.pid
+        ):
+            return state
+        if state.get("lifecycle") != "launching" or state.get("pid") != 0:
+            raise DaemonError("daemon child wrote an invalid lifecycle claim")
+        time.sleep(POLL_INTERVAL_SECONDS)
+    raise DaemonError(
+        f"Nomad daemon did not claim lifecycle state within {timeout:g} seconds"
+    )
 
 
 def _process_owns_instance(pid: int, instance_id: str) -> bool:

@@ -64,6 +64,14 @@ def _state(project: Path, *, pid=4242, instance_id="instance-1"):
     return paths, payload
 
 
+def _launching_state(project: Path, *, instance_id="instance-1"):
+    paths, payload = _state(project, pid=1, instance_id=instance_id)
+    payload["pid"] = 0
+    payload["lifecycle"] = "launching"
+    daemon._write_state(paths["state"], payload)
+    return paths, payload
+
+
 def _mock_successful_start(monkeypatch, process=None):
     process = process or FakeProcess()
     popen_calls = []
@@ -74,9 +82,24 @@ def _mock_successful_start(monkeypatch, process=None):
 
     monkeypatch.setattr(daemon.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(daemon, "_can_connect", lambda host, port: False)
+    _mock_child_claim(monkeypatch)
     monkeypatch.setattr(daemon, "_wait_until_ready", lambda *args: None)
     monkeypatch.setattr(daemon, "_process_owns_instance", lambda pid, instance: True)
     return process, popen_calls
+
+
+def _mock_child_claim(monkeypatch):
+    def claim(process, paths, project_root, instance_id, timeout=10.0):
+        state = json.loads(paths["state"].read_text(encoding="utf-8"))
+        assert state["lifecycle"] == "launching"
+        assert state["pid"] == 0
+        assert state["instance_id"] == instance_id
+        state["lifecycle"] = "starting"
+        state["pid"] = process.pid
+        daemon._write_state(paths["state"], state)
+        return state
+
+    monkeypatch.setattr(daemon, "_wait_for_child_claim", claim)
 
 
 def test_start_writes_secure_project_state_and_log(
@@ -119,7 +142,8 @@ def test_start_writes_secure_project_state_and_log(
 
     command, kwargs = popen_calls[0]
     assert command[:4] == [sys.executable, "-m", "nomad.cli", "serve"]
-    assert command[-2:] == ["--daemon-id", state_payload["instance_id"]]
+    assert command[command.index("--daemon-id") + 1] == state_payload["instance_id"]
+    assert command[command.index("--daemon-state") + 1] == str(paths["state"])
     assert kwargs["cwd"] == project.resolve()
     assert kwargs["stdin"] is subprocess.DEVNULL
     assert kwargs["start_new_session"] is True
@@ -156,6 +180,7 @@ def test_starting_state_exists_while_readiness_is_running(
         "Popen",
         lambda *args, **kwargs: process,
     )
+    _mock_child_claim(monkeypatch)
     monkeypatch.setattr(daemon, "_can_connect", lambda host, port: False)
     monkeypatch.setattr(daemon, "_process_owns_instance", lambda *args: True)
 
@@ -173,6 +198,149 @@ def test_starting_state_exists_while_readiness_is_running(
     assert "token" not in observed
     assert result["status"] == "running"
     assert result["lifecycle"] == "running"
+
+
+def test_launching_state_exists_before_popen_and_failure_cleans_it(
+    daemon_home, project, monkeypatch
+):
+    observed = {}
+
+    def fail_after_observing(command, **kwargs):
+        state_path = Path(command[command.index("--daemon-state") + 1])
+        observed.update(json.loads(state_path.read_text(encoding="utf-8")))
+        raise OSError("popen failed")
+
+    monkeypatch.setattr(daemon.subprocess, "Popen", fail_after_observing)
+    monkeypatch.setattr(daemon, "_can_connect", lambda host, port: False)
+
+    with pytest.raises(daemon.DaemonError, match="failed to launch"):
+        daemon.start_daemon(project=project)
+
+    paths = daemon._project_paths(project.resolve())
+    assert observed["lifecycle"] == "launching"
+    assert observed["pid"] == 0
+    assert "token" not in observed
+    assert not paths["state"].exists()
+
+
+def test_child_claims_launching_state_without_project_lock(
+    daemon_home, project, monkeypatch
+):
+    paths, payload = _launching_state(project, instance_id="claim-me")
+    monkeypatch.chdir(project)
+
+    claimed = daemon.claim_daemon_state(paths["state"], "claim-me")
+
+    assert claimed["pid"] == os.getpid()
+    assert claimed["lifecycle"] == "starting"
+    assert claimed["instance_id"] == payload["instance_id"]
+    assert json.loads(paths["state"].read_text(encoding="utf-8")) == claimed
+    assert stat.S_IMODE(paths["state"].stat().st_mode) == 0o600
+    assert stat.S_IMODE(paths["claim_lock"].stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize("invalid", ["path", "relative_path", "instance_id"])
+def test_child_claim_rejects_invalid_state_path_or_instance(
+    daemon_home, project, tmp_path, monkeypatch, invalid
+):
+    paths, _ = _launching_state(project, instance_id="expected")
+    monkeypatch.chdir(project)
+    state_path: str | Path = paths["state"]
+    instance_id = "expected"
+    if invalid == "path":
+        state_path = tmp_path / "other-state.json"
+    elif invalid == "relative_path":
+        state_path = Path(paths["state"].name)
+    else:
+        instance_id = "other"
+
+    with pytest.raises(daemon.DaemonError):
+        daemon.claim_daemon_state(state_path, instance_id)
+
+    persisted = json.loads(paths["state"].read_text(encoding="utf-8"))
+    assert persisted["lifecycle"] == "launching"
+    assert persisted["pid"] == 0
+
+
+def test_child_claim_rejects_symlink_state(
+    daemon_home, project, tmp_path, monkeypatch
+):
+    paths, payload = _launching_state(project, instance_id="expected")
+    target = tmp_path / "state-target.json"
+    target.write_text(json.dumps(payload), encoding="utf-8")
+    paths["state"].unlink()
+    paths["state"].symlink_to(target)
+    monkeypatch.chdir(project)
+
+    with pytest.raises(daemon.DaemonError, match="cannot read"):
+        daemon.claim_daemon_state(paths["state"], "expected")
+
+    assert paths["state"].is_symlink()
+
+
+def test_status_recovers_claimed_daemon_after_launcher_crash(
+    daemon_home, project, monkeypatch
+):
+    paths, _ = _launching_state(project, instance_id="orphan-safe")
+    paths["token"].write_text("recovery-token\n", encoding="ascii")
+    monkeypatch.chdir(project)
+    claimed = daemon.claim_daemon_state(paths["state"], "orphan-safe")
+    monkeypatch.setattr(daemon, "_pid_is_alive", lambda pid: True)
+    monkeypatch.setattr(daemon, "_process_owns_instance", lambda *args: True)
+    monkeypatch.setattr(
+        daemon,
+        "_mcp_health_data",
+        lambda url, token, *, timeout: {"pid": claimed["pid"]},
+    )
+
+    status = daemon.status_daemon(project=project)
+
+    assert status["status"] == "running"
+    assert status["pid"] == os.getpid()
+
+    alive = iter([True, False])
+    killed = []
+    monkeypatch.setattr(daemon, "_pid_is_alive", lambda pid: next(alive))
+    monkeypatch.setattr(
+        daemon.os,
+        "kill",
+        lambda pid, sig: killed.append((pid, sig)),
+    )
+    stopped = daemon.stop_daemon(project=project)
+
+    assert stopped["status"] == "stopped"
+    assert killed == [(os.getpid(), signal.SIGTERM)]
+    assert not paths["state"].exists()
+
+
+@pytest.mark.parametrize("operation", ["status", "start", "stop"])
+def test_unclaimed_launching_state_is_cleaned_without_killing_pid_zero(
+    daemon_home, project, monkeypatch, operation
+):
+    paths, _ = _launching_state(project)
+    monkeypatch.setattr(daemon, "LAUNCH_CLAIM_TIMEOUT_SECONDS", 0.0)
+    killed = []
+    monkeypatch.setattr(
+        daemon.os,
+        "kill",
+        lambda pid, sig: killed.append((pid, sig)),
+    )
+
+    if operation == "status":
+        result = daemon.status_daemon(project=project)
+        assert result["status"] == "stopped"
+        assert result["stale_state_removed"] is True
+    elif operation == "stop":
+        result = daemon.stop_daemon(project=project)
+        assert result["status"] == "stopped"
+        assert result["stale_state_removed"] is True
+    else:
+        _mock_successful_start(monkeypatch)
+        result = daemon.start_daemon(project=project)
+        assert result["status"] == "running"
+
+    assert killed == []
+    assert not paths["state"].exists() or operation == "start"
 
 
 def test_status_recovers_starting_daemon_after_launcher_crash(
@@ -327,6 +495,7 @@ def test_failed_start_returns_error_and_leaves_no_state(
 ):
     process = FakeProcess()
     monkeypatch.setattr(daemon.subprocess, "Popen", lambda *args, **kwargs: process)
+    _mock_child_claim(monkeypatch)
     monkeypatch.setattr(daemon, "_can_connect", lambda host, port: False)
     monkeypatch.setattr(
         daemon,
@@ -354,6 +523,7 @@ def test_keyboard_interrupt_terminates_child_and_removes_starting_state(
         "Popen",
         lambda *args, **kwargs: process,
     )
+    _mock_child_claim(monkeypatch)
     monkeypatch.setattr(daemon, "_can_connect", lambda host, port: False)
     monkeypatch.setattr(
         daemon,
@@ -371,7 +541,7 @@ def test_keyboard_interrupt_terminates_child_and_removes_starting_state(
     assert paths["token"].exists()
 
 
-@pytest.mark.parametrize("fail_on_write", [1, 2])
+@pytest.mark.parametrize("fail_on_write", [1, 2, 3])
 def test_state_write_failure_terminates_child_and_removes_state(
     daemon_home, project, monkeypatch, fail_on_write
 ):
@@ -392,9 +562,34 @@ def test_state_write_failure_terminates_child_and_removes_state(
         daemon.start_daemon(project=project)
 
     paths = daemon._project_paths(project.resolve())
-    assert process.terminated is True
+    assert process.terminated is (fail_on_write != 1)
     assert not paths["state"].exists()
-    assert paths["token"].exists()
+    assert paths["token"].exists() is (fail_on_write != 1)
+
+
+def test_partial_initial_state_write_failure_removes_state(
+    daemon_home, project, monkeypatch
+):
+    original_write_state = daemon._write_state
+
+    def write_then_fail(path, state):
+        original_write_state(path, state)
+        raise OSError("post-replace chmod failed")
+
+    monkeypatch.setattr(daemon, "_write_state", write_then_fail)
+    monkeypatch.setattr(
+        daemon.subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail("Popen must not run"),
+    )
+    monkeypatch.setattr(daemon, "_can_connect", lambda host, port: False)
+
+    with pytest.raises(OSError, match="post-replace"):
+        daemon.start_daemon(project=project)
+
+    paths = daemon._project_paths(project.resolve())
+    assert not paths["state"].exists()
+    assert not paths["token"].exists()
 
 
 def test_token_is_reused_across_failed_start_and_retry(
@@ -408,6 +603,7 @@ def test_token_is_reused_across_failed_start_and_retry(
         "Popen",
         lambda *args, **kwargs: next(processes),
     )
+    _mock_child_claim(monkeypatch)
     monkeypatch.setattr(daemon, "_can_connect", lambda host, port: False)
     readiness = iter([daemon.DaemonError("not ready"), None])
 
@@ -749,6 +945,36 @@ def test_wait_until_ready_requires_authenticated_health_with_matching_pid(
     assert calls[0][1] == "private-token"
 
 
+def test_wait_for_child_claim_accepts_only_matching_starting_state(
+    daemon_home, project
+):
+    process = FakeProcess(pid=4242)
+    paths, payload = _launching_state(project, instance_id="child-instance")
+    polls = 0
+
+    def poll():
+        nonlocal polls
+        polls += 1
+        if polls == 1:
+            payload["pid"] = process.pid
+            payload["lifecycle"] = "starting"
+            daemon._write_state(paths["state"], payload)
+        return None
+
+    process.poll = poll
+
+    claimed = daemon._wait_for_child_claim(
+        process,
+        paths,
+        project.resolve(),
+        "child-instance",
+        timeout=0.5,
+    )
+
+    assert claimed["pid"] == process.pid
+    assert claimed["lifecycle"] == "starting"
+
+
 @pytest.mark.parametrize(
     ("health_behavior", "expected_error"),
     [
@@ -851,4 +1077,18 @@ def test_valid_state_rejects_invalid_semantic_values(
     _, payload = _state(project)
     payload[field] = value
 
+    assert daemon._valid_state(payload, project.resolve()) is False
+
+
+def test_valid_state_allows_only_pid_zero_for_launching(daemon_home, project):
+    _, payload = _state(project)
+    payload["lifecycle"] = "launching"
+    payload["pid"] = 0
+    assert daemon._valid_state(payload, project.resolve()) is True
+
+    payload["pid"] = 42
+    assert daemon._valid_state(payload, project.resolve()) is False
+
+    payload["lifecycle"] = "starting"
+    payload["pid"] = 0
     assert daemon._valid_state(payload, project.resolve()) is False

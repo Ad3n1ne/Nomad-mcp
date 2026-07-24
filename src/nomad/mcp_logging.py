@@ -34,8 +34,22 @@ AUTH_RE = re.compile(
     r"((?:authorization|auth_token)\s*(?::|=)\s*(?:Bearer|Basic|Token)\s+)[^\s]+",
     re.IGNORECASE,
 )
+PEM_PRIVATE_KEY_RE = re.compile(
+    r"""
+    -----BEGIN\ (?P<key_type>
+        PRIVATE\ KEY
+        |RSA\ PRIVATE\ KEY
+        |EC\ PRIVATE\ KEY
+        |OPENSSH\ PRIVATE\ KEY
+    )-----
+    .*?
+    -----END\ (?P=key_type)-----
+    """,
+    re.DOTALL | re.VERBOSE,
+)
 ASSIGNMENT_RE = re.compile(
     r"""
+    (?<![A-Za-z0-9_.-])
     (?P<key_quote>["']?)
     (?P<key>[A-Za-z_][A-Za-z0-9_.-]*)
     (?P=key_quote)
@@ -155,9 +169,19 @@ def format_traceback(exc: BaseException) -> str:
 def redact_text(value: str) -> str:
     """Redacts common credentials from text before it reaches MCP logs or diagnostics."""
     redacted = USERINFO_RE.sub(r"\1***:***@", value)
+    redacted = PEM_PRIVATE_KEY_RE.sub(_redact_pem_private_key, redacted)
     redacted = _redact_sensitive_assignments(redacted)
     redacted = AUTH_RE.sub(r"\1[REDACTED]", redacted)
     return redacted
+
+
+def _redact_pem_private_key(match: re.Match[str]) -> str:
+    key_type = match.group("key_type")
+    return (
+        f"-----BEGIN {key_type}-----\n"
+        "[REDACTED]\n"
+        f"-----END {key_type}-----"
+    )
 
 
 def _redact_sensitive_assignments(value: str) -> str:
@@ -193,6 +217,8 @@ def _redact_sensitive_assignment(match: re.Match[str]) -> str:
 def _is_sensitive_assignment_key(key: str) -> bool:
     normalized = re.sub(r"[^A-Za-z0-9]+", "_", key).strip("_").upper()
     parts = tuple(part for part in normalized.split("_") if part)
+    if normalized == "KEY" or normalized.endswith("_KEY"):
+        return True
     if normalized in {
         "API_KEY",
         "API_TOKEN",
