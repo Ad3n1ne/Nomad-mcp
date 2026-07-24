@@ -5,13 +5,19 @@ from __future__ import annotations
 
 import atexit
 import functools
+import hashlib
+import hmac
 import inspect
 import json
 import os
 import sys
 import time
-from typing import Any, Callable, Literal
+from ipaddress import ip_address
+from typing import Any, Awaitable, Callable, Literal
 
+import anyio
+from mcp.server.auth.provider import AccessToken
+from mcp.server.auth.settings import AuthSettings
 from mcp.server.fastmcp import FastMCP
 
 from nomad import __version__
@@ -46,13 +52,49 @@ DEFAULT_PATH = "/mcp"
 Transport = Literal["stdio", "sse", "streamable-http"]
 
 
-def _safe_tool(func: Callable[..., str]) -> Callable[..., str]:
+class StaticBearerTokenVerifier:
+    """Verifies one static bearer token without retaining its plaintext."""
+
+    def __init__(self, token: str, *, resource: str) -> None:
+        if not isinstance(token, str) or not token:
+            raise ValueError("bearer token must be a non-empty string")
+        self._token_digest = hashlib.sha256(token.encode("utf-8")).digest()
+        self._resource = resource
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        candidate_digest = hashlib.sha256(token.encode("utf-8")).digest()
+        if not hmac.compare_digest(candidate_digest, self._token_digest):
+            return None
+        return AccessToken(
+            token=token,
+            client_id="nomad-static-token",
+            scopes=[],
+            resource=self._resource,
+        )
+
+
+def is_loopback_host(host: str) -> bool:
+    """Returns whether a listen host is restricted to the local machine."""
+    if not isinstance(host, str):
+        return False
+    normalized = host.strip().lower().rstrip(".")
+    if normalized == "localhost":
+        return True
+    if normalized.startswith("[") and normalized.endswith("]"):
+        normalized = normalized[1:-1]
+    try:
+        return ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
+def _safe_tool(func: Callable[..., str]) -> Callable[..., Awaitable[str]]:
     """Wraps an MCP tool so exceptions become structured failures, not transport death."""
     tool_name = func.__name__
     signature = inspect.signature(func)
 
     @functools.wraps(func)
-    def wrapper(*args: Any, **kwargs: Any) -> str:
+    async def wrapper(*args: Any, **kwargs: Any) -> str:
         logger = get_mcp_logger()
         logger.info(
             "tool entry name=%s params=%s",
@@ -60,7 +102,11 @@ def _safe_tool(func: Callable[..., str]) -> Callable[..., str]:
             summarize_call(args, kwargs, signature),
         )
         try:
-            result = func(*args, **kwargs)
+            call = functools.partial(func, *args, **kwargs)
+            result = await anyio.to_thread.run_sync(call, abandon_on_cancel=True)
+        except anyio.get_cancelled_exc_class():
+            logger.info("tool cancelled name=%s", tool_name)
+            raise
         except BaseException as exc:
             target = kwargs.get("target") if isinstance(kwargs.get("target"), str) else None
             exc_summary = redact_text(f"{type(exc).__name__}: {exc}")
@@ -89,12 +135,12 @@ def _safe_tool(func: Callable[..., str]) -> Callable[..., str]:
     return wrapper
 
 
-def _safe_resource(func: Callable[..., str]) -> Callable[..., str]:
+def _safe_resource(func: Callable[..., str]) -> Callable[..., Awaitable[str]]:
     resource_name = func.__name__
     signature = inspect.signature(func)
 
     @functools.wraps(func)
-    def wrapper(*args: Any, **kwargs: Any) -> str:
+    async def wrapper(*args: Any, **kwargs: Any) -> str:
         logger = get_mcp_logger()
         logger.info(
             "resource entry name=%s params=%s",
@@ -102,7 +148,11 @@ def _safe_resource(func: Callable[..., str]) -> Callable[..., str]:
             summarize_call(args, kwargs, signature),
         )
         try:
-            result = func(*args, **kwargs)
+            call = functools.partial(func, *args, **kwargs)
+            result = await anyio.to_thread.run_sync(call, abandon_on_cancel=True)
+        except anyio.get_cancelled_exc_class():
+            logger.info("resource cancelled name=%s", resource_name)
+            raise
         except BaseException as exc:
             exc_summary = redact_text(f"{type(exc).__name__}: {exc}")
             logger.error(
@@ -143,7 +193,7 @@ def health() -> str:
         },
     )
 
-@_safe_resource
+
 def get_current_project_resource() -> str:
     """Returns a sanitized summary of current project config and agent hints."""
     try:
@@ -235,12 +285,38 @@ def create_server(
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
     path: str = DEFAULT_PATH,
+    stateless_http: bool = True,
+    bearer_token: str | None = None,
 ) -> FastMCP:
     """Creates a fully registered Nomad MCP server."""
+    if not isinstance(host, str) or not host.strip():
+        raise ValueError("host must be a non-empty string")
     if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
         raise ValueError("port must be an integer between 1 and 65535")
     if not isinstance(path, str) or not path.startswith("/"):
         raise ValueError("path must start with '/'")
+    if not isinstance(stateless_http, bool):
+        raise ValueError("stateless_http must be a boolean")
+    if bearer_token is not None and (
+        not isinstance(bearer_token, str) or not bearer_token
+    ):
+        raise ValueError("bearer token must be a non-empty string")
+    if not is_loopback_host(host) and bearer_token is None:
+        raise ValueError("non-loopback hosts require bearer authentication")
+
+    endpoint_url = _endpoint_url(host, port, path)
+    auth = None
+    token_verifier = None
+    if bearer_token is not None:
+        auth = AuthSettings(
+            issuer_url=endpoint_url,
+            resource_server_url=endpoint_url,
+            required_scopes=[],
+        )
+        token_verifier = StaticBearerTokenVerifier(
+            bearer_token,
+            resource=endpoint_url,
+        )
 
     server = FastMCP(
         "nomad",
@@ -248,11 +324,23 @@ def create_server(
         host=host,
         port=port,
         streamable_http_path=path,
+        stateless_http=stateless_http,
+        auth=auth,
+        token_verifier=token_verifier,
     )
     for tool in TOOLS:
         server.tool()(_safe_tool(tool))
-    server.resource("config://current-project")(get_current_project_resource)
+    server.resource("config://current-project")(
+        _safe_resource(get_current_project_resource)
+    )
     return server
+
+
+def _endpoint_url(host: str, port: int, path: str) -> str:
+    normalized_host = host.strip()
+    if ":" in normalized_host and not normalized_host.startswith("["):
+        normalized_host = f"[{normalized_host}]"
+    return f"http://{normalized_host}:{port}{path}"
 
 
 mcp_server = create_server()
@@ -264,12 +352,20 @@ def main(
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
     path: str = DEFAULT_PATH,
+    stateless_http: bool = True,
+    bearer_token: str | None = None,
 ) -> None:
     """Server CLI Entry."""
     log_server_startup(os.getcwd(), __version__)
     atexit.register(log_server_shutdown)
     try:
-        create_server(host=host, port=port, path=path).run(transport=transport)
+        create_server(
+            host=host,
+            port=port,
+            path=path,
+            stateless_http=stateless_http,
+            bearer_token=bearer_token,
+        ).run(transport=transport)
     except KeyboardInterrupt:
         return
 

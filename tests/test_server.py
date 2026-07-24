@@ -1,6 +1,14 @@
+import inspect
 import json
 import os
+import threading
+import time
+
+import anyio
+import httpx
 import pytest
+from mcp import ClientSession
+from mcp.client.streamable_http import streamable_http_client
 
 from nomad.server import (
     DEFAULT_HOST,
@@ -11,10 +19,18 @@ from nomad.server import (
     create_server,
     get_current_project_resource,
     health,
+    is_loopback_host,
     log_server_shutdown,
     main,
     mcp_server,
 )
+
+
+def run_async(async_callable, *args, **kwargs):
+    async def runner():
+        return await async_callable(*args, **kwargs)
+
+    return anyio.run(runner)
 
 
 def test_server_tools_registered():
@@ -49,8 +65,13 @@ def test_create_server_configures_http_and_preserves_registrations():
     assert server.settings.host == "localhost"
     assert server.settings.port == 9876
     assert server.settings.streamable_http_path == "/nomad"
+    assert server.settings.stateless_http is True
     assert set(server._tool_manager._tools) == set(mcp_server._tool_manager._tools)
     assert set(server._resource_manager._resources) == set(mcp_server._resource_manager._resources)
+
+
+def test_create_server_can_disable_stateless_http():
+    assert create_server(stateless_http=False).settings.stateless_http is False
 
 
 @pytest.mark.parametrize("port", [0, 65536, -1, True, "8765"])
@@ -65,6 +86,24 @@ def test_create_server_rejects_invalid_path(path):
         create_server(path=path)
 
 
+@pytest.mark.parametrize("host", ["0.0.0.0", "::", "192.168.1.25", "nomad.local"])
+def test_create_server_rejects_unauthenticated_non_loopback_host(host):
+    with pytest.raises(ValueError, match="bearer"):
+        create_server(host=host)
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "::1", "[::1]", "localhost", "LOCALHOST."])
+def test_is_loopback_host(host):
+    assert is_loopback_host(host) is True
+
+
+def test_create_server_accepts_authenticated_non_loopback_host():
+    server = create_server(host="0.0.0.0", bearer_token="test-token")
+
+    assert server.settings.auth is not None
+    assert server._token_verifier is not None
+
+
 def test_server_main_defaults_to_stdio(monkeypatch):
     calls = {}
 
@@ -72,8 +111,8 @@ def test_server_main_defaults_to_stdio(monkeypatch):
         def run(self, *, transport):
             calls["transport"] = transport
 
-    def fake_create_server(*, host, port, path):
-        calls["config"] = (host, port, path)
+    def fake_create_server(**kwargs):
+        calls["config"] = kwargs
         return FakeServer()
 
     monkeypatch.setattr("nomad.server.create_server", fake_create_server)
@@ -83,7 +122,13 @@ def test_server_main_defaults_to_stdio(monkeypatch):
     main()
 
     assert calls == {
-        "config": (DEFAULT_HOST, DEFAULT_PORT, DEFAULT_PATH),
+        "config": {
+            "host": DEFAULT_HOST,
+            "port": DEFAULT_PORT,
+            "path": DEFAULT_PATH,
+            "stateless_http": True,
+            "bearer_token": None,
+        },
         "transport": "stdio",
     }
 
@@ -95,8 +140,8 @@ def test_server_main_accepts_explicit_transport_and_http_options(monkeypatch):
         def run(self, *, transport):
             calls["transport"] = transport
 
-    def fake_create_server(*, host, port, path):
-        calls["config"] = (host, port, path)
+    def fake_create_server(**kwargs):
+        calls["config"] = kwargs
         return FakeServer()
 
     monkeypatch.setattr("nomad.server.create_server", fake_create_server)
@@ -108,10 +153,17 @@ def test_server_main_accepts_explicit_transport_and_http_options(monkeypatch):
         host="localhost",
         port=9999,
         path="/custom",
+        bearer_token="secret",
     )
 
     assert calls == {
-        "config": ("localhost", 9999, "/custom"),
+        "config": {
+            "host": "localhost",
+            "port": 9999,
+            "path": "/custom",
+            "stateless_http": True,
+            "bearer_token": "secret",
+        },
         "transport": "streamable-http",
     }
 
@@ -159,7 +211,8 @@ def test_safe_tool_catches_exception_and_logs_traceback(tmp_path, monkeypatch):
         raise RuntimeError("kaboom")
 
     wrapped = _safe_tool(boom)
-    res = json.loads(wrapped(target="gpu"))
+    assert inspect.iscoroutinefunction(wrapped)
+    res = json.loads(run_async(wrapped, target="gpu"))
 
     assert res["ok"] is False
     assert res["tool"] == "boom"
@@ -181,7 +234,8 @@ def test_safe_tool_redacts_sensitive_params_from_log(tmp_path, monkeypatch):
         return json.dumps({"ok": True, "tool": "accepts_sensitive", "target": target})
 
     wrapped = _safe_tool(accepts_sensitive)
-    wrapped(
+    run_async(
+        wrapped,
         "curl -H 'Authorization: Bearer secret-token' https://example.test",
         '{"runtime":{"extra_env":{"API_TOKEN":"supersecret"}}}',
         target="gpu",
@@ -204,7 +258,8 @@ def test_safe_resource_catches_exception_and_logs_traceback(tmp_path, monkeypatc
         raise ValueError("resource broke")
 
     wrapped = _safe_resource(broken_resource)
-    res = json.loads(wrapped())
+    assert inspect.iscoroutinefunction(wrapped)
+    res = json.loads(run_async(wrapped))
 
     assert res["ok"] is False
     assert res["tool"] == "broken_resource"
@@ -212,6 +267,168 @@ def test_safe_resource_catches_exception_and_logs_traceback(tmp_path, monkeypatc
     log_content = log_path.read_text(encoding="utf-8")
     assert "resource exception name=broken_resource" in log_content
     assert "ValueError: resource broke" in log_content
+
+
+@pytest.mark.parametrize(
+    ("wrapper_factory", "entry_kind"),
+    [(_safe_tool, "tool"), (_safe_resource, "resource")],
+)
+def test_wrapper_cancellation_is_not_structured_as_internal_error(
+    tmp_path,
+    monkeypatch,
+    wrapper_factory,
+    entry_kind,
+):
+    log_path = tmp_path / "nomad-mcp.log"
+    monkeypatch.setenv("NOMAD_MCP_LOG_PATH", str(log_path))
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking() -> str:
+        started.set()
+        release.wait(timeout=2)
+        return "{}"
+
+    wrapped = wrapper_factory(blocking)
+
+    async def scenario():
+        before = time.monotonic()
+        with anyio.move_on_after(0.1) as scope:
+            await wrapped()
+        assert scope.cancel_called
+        assert time.monotonic() - before < 0.5
+
+    try:
+        anyio.run(scenario)
+    finally:
+        release.set()
+
+    log_content = log_path.read_text(encoding="utf-8")
+    assert f"{entry_kind} cancelled name=blocking" in log_content
+    assert f"{entry_kind} exception name=blocking" not in log_content
+
+
+def test_safe_tool_structures_non_cancellation_base_exception():
+    class WorkerExit(BaseException):
+        pass
+
+    def exits() -> str:
+        raise WorkerExit("worker stopped")
+
+    payload = json.loads(run_async(_safe_tool(exits)))
+
+    assert payload["ok"] is False
+    assert payload["error_type"] == "internal_error"
+    assert payload["diagnostics"][0] == "WorkerExit: worker stopped"
+
+
+def test_slow_tool_does_not_block_health():
+    started = threading.Event()
+    release = threading.Event()
+    slow_result = {}
+
+    def slow_tool() -> str:
+        started.set()
+        release.wait(timeout=2)
+        return json.dumps({"ok": True})
+
+    wrapped_slow = _safe_tool(slow_tool)
+    wrapped_health = _safe_tool(health)
+
+    async def scenario():
+        async def run_slow():
+            slow_result["value"] = await wrapped_slow()
+
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(run_slow)
+            with anyio.fail_after(0.5):
+                while not started.is_set():
+                    await anyio.sleep(0.01)
+                health_payload = json.loads(await wrapped_health())
+            assert health_payload["ok"] is True
+            release.set()
+
+    try:
+        anyio.run(scenario)
+    finally:
+        release.set()
+
+    assert json.loads(slow_result["value"])["ok"] is True
+
+
+def test_registered_tools_and_resource_use_async_wrappers():
+    assert all(
+        inspect.iscoroutinefunction(tool.fn)
+        for tool in mcp_server._tool_manager._tools.values()
+    )
+    resource = mcp_server._resource_manager._resources[
+        "config://current-project"
+    ]
+    assert inspect.iscoroutinefunction(resource.fn)
+    assert not inspect.iscoroutinefunction(health)
+    assert not inspect.iscoroutinefunction(get_current_project_resource)
+
+
+def test_streamable_http_bearer_authentication(tmp_path, monkeypatch):
+    token = "correct-test-token"
+    log_path = tmp_path / "nomad-mcp.log"
+    monkeypatch.setenv("NOMAD_MCP_LOG_PATH", str(log_path))
+    server = create_server(bearer_token=token)
+    app = server.streamable_http_app()
+
+    async def initialize_response(client: httpx.AsyncClient) -> httpx.Response:
+        return await client.post(
+            "/mcp",
+            headers={
+                "accept": "application/json, text/event-stream",
+                "content-type": "application/json",
+            },
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "nomad-test", "version": "1"},
+                },
+            },
+        )
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=app)
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://127.0.0.1:8765",
+            ) as unauthenticated:
+                assert (await initialize_response(unauthenticated)).status_code == 401
+
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://127.0.0.1:8765",
+                headers={"Authorization": "Bearer wrong-test-token"},
+            ) as wrong_token:
+                assert (await initialize_response(wrong_token)).status_code == 401
+
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://127.0.0.1:8765",
+                headers={"Authorization": f"Bearer {token}"},
+            ) as authenticated:
+                async with streamable_http_client(
+                    "http://127.0.0.1:8765/mcp",
+                    http_client=authenticated,
+                ) as streams:
+                    async with ClientSession(streams[0], streams[1]) as session:
+                        await session.initialize()
+                        result = await session.call_tool("health")
+                        payload = json.loads(result.content[0].text)
+                        assert payload["ok"] is True
+                        assert payload["tool"] == "health"
+
+    anyio.run(scenario)
+    assert token not in log_path.read_text(encoding="utf-8")
 
 
 def test_resource_unconfigured(tmp_path, monkeypatch):

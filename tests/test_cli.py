@@ -54,6 +54,7 @@ def test_cli_client_config_installed_toml(capsys):
 
 def test_cli_serve_uses_streamable_http_defaults(monkeypatch):
     calls = []
+    monkeypatch.delenv("NOMAD_MCP_BEARER_TOKEN", raising=False)
     monkeypatch.setattr(
         "nomad.server.main",
         lambda **kwargs: calls.append(kwargs),
@@ -67,12 +68,14 @@ def test_cli_serve_uses_streamable_http_defaults(monkeypatch):
             "host": "127.0.0.1",
             "port": 8765,
             "path": "/mcp",
+            "bearer_token": None,
         }
     ]
 
 
 def test_cli_serve_passes_explicit_http_options(monkeypatch):
     calls = []
+    monkeypatch.setenv("NOMAD_MCP_BEARER_TOKEN", "environment-secret")
     monkeypatch.setattr(
         "nomad.server.main",
         lambda **kwargs: calls.append(kwargs),
@@ -88,8 +91,48 @@ def test_cli_serve_passes_explicit_http_options(monkeypatch):
             "host": "localhost",
             "port": 9999,
             "path": "/nomad",
+            "bearer_token": "environment-secret",
         }
     ]
+
+
+def test_cli_serve_remote_requires_explicit_allow_remote(monkeypatch):
+    monkeypatch.setenv("NOMAD_MCP_BEARER_TOKEN", "environment-secret")
+
+    with pytest.raises(SystemExit):
+        main(["serve", "--host", "0.0.0.0"])
+
+
+def test_cli_serve_remote_requires_env_token_when_explicitly_allowed(monkeypatch):
+    monkeypatch.delenv("NOMAD_MCP_BEARER_TOKEN", raising=False)
+
+    with pytest.raises(SystemExit):
+        main(["serve", "--host", "0.0.0.0", "--allow-remote"])
+
+
+def test_cli_serve_remote_passes_env_token_when_explicitly_allowed(monkeypatch):
+    calls = []
+    monkeypatch.setenv("NOMAD_MCP_BEARER_TOKEN", "environment-secret")
+    monkeypatch.setattr(
+        "nomad.server.main",
+        lambda **kwargs: calls.append(kwargs),
+    )
+
+    assert main(["serve", "--host", "0.0.0.0", "--allow-remote"]) is None
+    assert calls == [
+        {
+            "transport": "streamable-http",
+            "host": "0.0.0.0",
+            "port": 8765,
+            "path": "/mcp",
+            "bearer_token": "environment-secret",
+        }
+    ]
+
+
+def test_cli_serve_does_not_accept_token_on_command_line():
+    with pytest.raises(SystemExit):
+        main(["serve", "--bearer-token", "secret"])
 
 
 @pytest.mark.parametrize("port", ["0", "65536", "invalid"])

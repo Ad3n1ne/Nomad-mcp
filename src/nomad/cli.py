@@ -45,13 +45,27 @@ def main(argv: list[str] | None = None) -> int | None:
         print(_client_config(args.runner, args.format))
         return 0
     if args.command == "serve":
-        from nomad.server import main as server_main
+        from nomad.server import is_loopback_host, main as server_main
+
+        if (
+            not is_loopback_host(args.host)
+            and not args.allow_remote
+            and args.daemon_id is None
+        ):
+            parser.error("serve on a non-loopback host requires --allow-remote")
+        bearer_token = os.environ.get("NOMAD_MCP_BEARER_TOKEN") or None
+        if not is_loopback_host(args.host) and bearer_token is None:
+            parser.error(
+                "serve on a non-loopback host requires "
+                "NOMAD_MCP_BEARER_TOKEN"
+            )
 
         server_main(
             transport="streamable-http",
             host=args.host,
             port=args.port,
             path=args.path,
+            bearer_token=bearer_token,
         )
         return None
     if args.command == "daemon":
@@ -119,6 +133,11 @@ def _build_parser() -> argparse.ArgumentParser:
         type=_valid_path,
         default="/mcp",
         help="Streamable HTTP endpoint path (default: /mcp).",
+    )
+    serve_parser.add_argument(
+        "--allow-remote",
+        action="store_true",
+        help="Explicitly allow a non-loopback listen host; bearer authentication is still required.",
     )
     serve_parser.add_argument("--daemon-id", help=argparse.SUPPRESS)
 
