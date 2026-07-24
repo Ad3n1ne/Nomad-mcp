@@ -4,6 +4,7 @@ import subprocess
 import pytest
 
 from nomad import __version__
+from nomad import daemon
 from nomad.cli import main
 
 
@@ -100,6 +101,77 @@ def test_cli_serve_rejects_invalid_port(port):
 def test_cli_serve_rejects_path_without_leading_slash():
     with pytest.raises(SystemExit):
         main(["serve", "--path", "mcp"])
+
+
+def test_cli_daemon_start_dispatches_all_options(monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(
+        daemon,
+        "start_daemon",
+        lambda **kwargs: calls.append(kwargs) or {"status": "running"},
+    )
+
+    assert main(
+        [
+            "daemon",
+            "start",
+            "--project",
+            "/tmp/project",
+            "--host",
+            "localhost",
+            "--port",
+            "9876",
+            "--path",
+            "/nomad",
+            "--allow-remote",
+        ]
+    ) == 0
+
+    assert calls == [
+        {
+            "project": "/tmp/project",
+            "host": "localhost",
+            "port": 9876,
+            "path": "/nomad",
+            "allow_remote": True,
+        }
+    ]
+    assert json.loads(capsys.readouterr().out)["status"] == "running"
+
+
+@pytest.mark.parametrize(
+    ("command", "function_name"),
+    [
+        ("status", "status_daemon"),
+        ("restart", "restart_daemon"),
+        ("stop", "stop_daemon"),
+    ],
+)
+def test_cli_daemon_project_command_dispatch(monkeypatch, capsys, command, function_name):
+    calls = []
+    monkeypatch.setattr(
+        daemon,
+        function_name,
+        lambda **kwargs: calls.append(kwargs) or {"status": command},
+    )
+
+    assert main(["daemon", command, "--project", "/tmp/project"]) == 0
+
+    assert calls == [{"project": "/tmp/project"}]
+    assert json.loads(capsys.readouterr().out)["status"] == command
+
+
+def test_cli_daemon_error_is_reported_without_traceback(monkeypatch, capsys):
+    def fail(**kwargs):
+        raise daemon.DaemonError("daemon unavailable")
+
+    monkeypatch.setattr(daemon, "status_daemon", fail)
+
+    assert main(["daemon", "status"]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.strip() == "error: daemon unavailable"
 
 
 def test_cli_doctor_success(monkeypatch, capsys):

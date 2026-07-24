@@ -54,6 +54,8 @@ def main(argv: list[str] | None = None) -> int | None:
             path=args.path,
         )
         return None
+    if args.command == "daemon":
+        return _run_daemon_command(args)
 
     parser.print_help()
     return 0
@@ -118,7 +120,87 @@ def _build_parser() -> argparse.ArgumentParser:
         default="/mcp",
         help="Streamable HTTP endpoint path (default: /mcp).",
     )
+    serve_parser.add_argument("--daemon-id", help=argparse.SUPPRESS)
+
+    daemon_parser = subparsers.add_parser(
+        "daemon", help="Manage a persistent project-scoped Nomad MCP server."
+    )
+    daemon_subparsers = daemon_parser.add_subparsers(
+        dest="daemon_command",
+        required=True,
+    )
+    daemon_start_parser = daemon_subparsers.add_parser(
+        "start", help="Start the project daemon."
+    )
+    _add_project_argument(daemon_start_parser)
+    daemon_start_parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Listen host (default: 127.0.0.1).",
+    )
+    daemon_start_parser.add_argument(
+        "--port",
+        type=_valid_port,
+        default=8765,
+        help="Listen port from 1 to 65535 (default: 8765).",
+    )
+    daemon_start_parser.add_argument(
+        "--path",
+        type=_valid_path,
+        default="/mcp",
+        help="Streamable HTTP endpoint path (default: /mcp).",
+    )
+    daemon_start_parser.add_argument(
+        "--allow-remote",
+        action="store_true",
+        help="Explicitly allow a non-loopback listen host.",
+    )
+    for daemon_command in ("status", "restart", "stop"):
+        command_parser = daemon_subparsers.add_parser(
+            daemon_command,
+            help=f"{daemon_command.capitalize()} the project daemon.",
+        )
+        _add_project_argument(command_parser)
     return parser
+
+
+def _add_project_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--project",
+        help="Project root (default: current working directory).",
+    )
+
+
+def _run_daemon_command(args: argparse.Namespace) -> int:
+    from nomad.daemon import (
+        DaemonError,
+        restart_daemon,
+        start_daemon,
+        status_daemon,
+        stop_daemon,
+    )
+
+    try:
+        if args.daemon_command == "start":
+            result = start_daemon(
+                project=args.project,
+                host=args.host,
+                port=args.port,
+                path=args.path,
+                allow_remote=args.allow_remote,
+            )
+        elif args.daemon_command == "status":
+            result = status_daemon(project=args.project)
+        elif args.daemon_command == "restart":
+            result = restart_daemon(project=args.project)
+        else:
+            result = stop_daemon(project=args.project)
+    except DaemonError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
 
 
 def _valid_port(value: str) -> int:
