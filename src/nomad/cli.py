@@ -47,11 +47,7 @@ def main(argv: list[str] | None = None) -> int | None:
     if args.command == "serve":
         from nomad.server import is_loopback_host, main as server_main
 
-        if (
-            not is_loopback_host(args.host)
-            and not args.allow_remote
-            and args.daemon_id is None
-        ):
+        if not is_loopback_host(args.host) and not args.allow_remote:
             parser.error("serve on a non-loopback host requires --allow-remote")
         bearer_token = os.environ.get("NOMAD_MCP_BEARER_TOKEN") or None
         if not is_loopback_host(args.host) and bearer_token is None:
@@ -160,8 +156,8 @@ def _build_parser() -> argparse.ArgumentParser:
     daemon_start_parser.add_argument(
         "--port",
         type=_valid_port,
-        default=8765,
-        help="Listen port from 1 to 65535 (default: 8765).",
+        default=None,
+        help="Listen port from 1 to 65535 (default: stable project-derived high port).",
     )
     daemon_start_parser.add_argument(
         "--path",

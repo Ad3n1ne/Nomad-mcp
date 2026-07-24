@@ -103,6 +103,21 @@ def test_cli_serve_remote_requires_explicit_allow_remote(monkeypatch):
         main(["serve", "--host", "0.0.0.0"])
 
 
+def test_cli_serve_hidden_daemon_id_cannot_bypass_allow_remote(monkeypatch):
+    monkeypatch.setenv("NOMAD_MCP_BEARER_TOKEN", "environment-secret")
+
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "serve",
+                "--host",
+                "0.0.0.0",
+                "--daemon-id",
+                "internal-instance",
+            ]
+        )
+
+
 def test_cli_serve_remote_requires_env_token_when_explicitly_allowed(monkeypatch):
     monkeypatch.delenv("NOMAD_MCP_BEARER_TOKEN", raising=False)
 
@@ -177,6 +192,30 @@ def test_cli_daemon_start_dispatches_all_options(monkeypatch, capsys):
             "port": 9876,
             "path": "/nomad",
             "allow_remote": True,
+        }
+    ]
+    assert json.loads(capsys.readouterr().out)["status"] == "running"
+
+
+def test_cli_daemon_start_omits_port_for_project_derived_default(
+    monkeypatch, capsys
+):
+    calls = []
+    monkeypatch.setattr(
+        daemon,
+        "start_daemon",
+        lambda **kwargs: calls.append(kwargs) or {"status": "running"},
+    )
+
+    assert main(["daemon", "start", "--project", "/tmp/project"]) == 0
+
+    assert calls == [
+        {
+            "project": "/tmp/project",
+            "host": "127.0.0.1",
+            "port": None,
+            "path": "/mcp",
+            "allow_remote": False,
         }
     ]
     assert json.loads(capsys.readouterr().out)["status"] == "running"

@@ -74,7 +74,7 @@ def _mock_successful_start(monkeypatch, process=None):
 
     monkeypatch.setattr(daemon.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(daemon, "_can_connect", lambda host, port: False)
-    monkeypatch.setattr(daemon, "_wait_until_ready", lambda proc, host, port: None)
+    monkeypatch.setattr(daemon, "_wait_until_ready", lambda *args: None)
     monkeypatch.setattr(daemon, "_process_owns_instance", lambda pid, instance: True)
     return process, popen_calls
 
@@ -90,23 +90,28 @@ def test_start_writes_secure_project_state_and_log(
     state_payload = json.loads(paths["state"].read_text())
     assert result["status"] == "running"
     assert result["already_running"] is False
+    expected_port = daemon.project_default_port(project)
     assert state_payload == {
         "schema_version": 1,
         "pid": process.pid,
         "project_root": str(project.resolve()),
         "host": "127.0.0.1",
-        "port": 8765,
+        "port": expected_port,
         "path": "/mcp",
-        "url": "http://127.0.0.1:8765/mcp",
+        "url": f"http://127.0.0.1:{expected_port}/mcp",
         "version": __version__,
         "started_at": state_payload["started_at"],
         "instance_id": state_payload["instance_id"],
         "log_path": str(paths["log"]),
+        "allow_remote": False,
+        "auth": True,
+        "token_env_var": daemon._project_token_env_var(project.resolve()),
     }
     assert stat.S_IMODE(daemon_home.stat().st_mode) == 0o700
     assert stat.S_IMODE(paths["state"].stat().st_mode) == 0o600
     assert stat.S_IMODE(paths["log"].stat().st_mode) == 0o600
     assert stat.S_IMODE(paths["lock"].stat().st_mode) == 0o600
+    assert stat.S_IMODE(paths["token"].stat().st_mode) == 0o600
 
     command, kwargs = popen_calls[0]
     assert command[:4] == [sys.executable, "-m", "nomad.cli", "serve"]
@@ -115,6 +120,12 @@ def test_start_writes_secure_project_state_and_log(
     assert kwargs["stdin"] is subprocess.DEVNULL
     assert kwargs["start_new_session"] is True
     assert kwargs["env"]["NOMAD_MCP_LOG_PATH"] == str(paths["log"])
+    token = paths["token"].read_text(encoding="ascii").strip()
+    assert kwargs["env"][daemon.BEARER_TOKEN_ENV_VAR] == token
+    assert token not in json.dumps(state_payload)
+    assert token not in json.dumps(result)
+    assert token not in " ".join(command)
+    assert token not in paths["log"].read_text(encoding="utf-8")
     assert kwargs["stdout"] is kwargs["stderr"]
 
 
@@ -161,6 +172,60 @@ def test_failed_start_returns_error_and_leaves_no_state(
     assert process.terminated is True
     assert process.waited is True
     assert not paths["state"].exists()
+    assert paths["token"].exists()
+
+
+def test_token_is_reused_across_failed_start_and_retry(
+    daemon_home, project, monkeypatch
+):
+    first_process = FakeProcess()
+    second_process = FakeProcess(pid=4343)
+    processes = iter([first_process, second_process])
+    monkeypatch.setattr(
+        daemon.subprocess,
+        "Popen",
+        lambda *args, **kwargs: next(processes),
+    )
+    monkeypatch.setattr(daemon, "_can_connect", lambda host, port: False)
+    readiness = iter([daemon.DaemonError("not ready"), None])
+
+    def wait(*args):
+        outcome = next(readiness)
+        if outcome is not None:
+            raise outcome
+
+    monkeypatch.setattr(daemon, "_wait_until_ready", wait)
+    monkeypatch.setattr(daemon, "_process_owns_instance", lambda *args: True)
+
+    with pytest.raises(daemon.DaemonError, match="not ready"):
+        daemon.start_daemon(project=project)
+    paths = daemon._project_paths(project.resolve())
+    first_token = paths["token"].read_text(encoding="ascii")
+
+    daemon.start_daemon(project=project)
+
+    assert paths["token"].read_text(encoding="ascii") == first_token
+
+
+def test_token_is_reused_across_stop_start_and_restart(
+    daemon_home, project, monkeypatch
+):
+    _, popen_calls = _mock_successful_start(monkeypatch)
+    daemon.start_daemon(project=project)
+    paths = daemon._project_paths(project.resolve())
+    original_token = paths["token"].read_text(encoding="ascii")
+    monkeypatch.setattr(daemon.os, "kill", lambda pid, sig: None)
+
+    monkeypatch.setattr(daemon, "_pid_is_alive", lambda pid: next(iter_alive))
+    iter_alive = iter([True, False])
+    daemon.stop_daemon(project=project)
+    daemon.start_daemon(project=project)
+
+    iter_alive = iter([True, False])
+    daemon.restart_daemon(project=project)
+
+    assert paths["token"].read_text(encoding="ascii") == original_token
+    assert len(popen_calls) == 3
 
 
 def test_failed_start_cleanup_kills_after_terminate_wait_timeout():
@@ -236,7 +301,23 @@ def test_projects_have_isolated_state_and_log_paths(
 
     assert first_paths["state"] != second_paths["state"]
     assert first_paths["log"] != second_paths["log"]
+    assert first_paths["token"] != second_paths["token"]
     assert first_paths["state"].parent == second_paths["state"].parent == daemon_home
+
+
+def test_default_project_ports_are_stable_and_isolated(tmp_path):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+
+    first_port = daemon.project_default_port(first)
+    second_port = daemon.project_default_port(second)
+
+    assert first_port == daemon.project_default_port(first.resolve())
+    assert daemon.PROJECT_PORT_MIN <= first_port <= daemon.PROJECT_PORT_MAX
+    assert daemon.PROJECT_PORT_MIN <= second_port <= daemon.PROJECT_PORT_MAX
+    assert first_port != second_port
 
 
 def test_non_loopback_requires_explicit_allow_remote(
@@ -245,7 +326,7 @@ def test_non_loopback_requires_explicit_allow_remote(
     with pytest.raises(daemon.DaemonError, match="--allow-remote"):
         daemon.start_daemon(project=project, host="0.0.0.0")
 
-    _mock_successful_start(monkeypatch)
+    _, popen_calls = _mock_successful_start(monkeypatch)
     result = daemon.start_daemon(
         project=project,
         host="0.0.0.0",
@@ -253,6 +334,8 @@ def test_non_loopback_requires_explicit_allow_remote(
     )
 
     assert result["host"] == "0.0.0.0"
+    assert result["allow_remote"] is True
+    assert "--allow-remote" in popen_calls[0][0]
     assert "warning:" in capsys.readouterr().err
 
 
@@ -284,6 +367,31 @@ def test_pid_alive_treats_zombie_as_stopped(monkeypatch):
     monkeypatch.setattr(daemon, "_process_state", lambda pid: "Z+")
 
     assert daemon._pid_is_alive(10) is False
+
+
+def test_status_uses_public_allowlist_and_never_leaks_token_fields(
+    daemon_home, project, monkeypatch
+):
+    paths, payload = _state(project)
+    payload.update(
+        {
+            "auth": True,
+            "token_env_var": daemon._project_token_env_var(project.resolve()),
+            "token": "secret",
+            "token_path": "/secret/path",
+        }
+    )
+    daemon._write_state(paths["state"], payload)
+    monkeypatch.setattr(daemon, "_pid_is_alive", lambda pid: True)
+    monkeypatch.setattr(daemon, "_process_owns_instance", lambda *args: True)
+
+    result = daemon.status_daemon(project=project)
+
+    assert result["auth"] is True
+    assert result["token_env_var"].startswith("NOMAD_MCP_BEARER_TOKEN_")
+    assert "token" not in result
+    assert "token_path" not in result
+    assert "secret" not in json.dumps(result)
 
 
 @pytest.mark.parametrize(

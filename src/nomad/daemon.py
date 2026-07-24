@@ -6,9 +6,11 @@ import fcntl
 import hashlib
 import json
 import os
+import secrets
 import shlex
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -28,6 +30,9 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 DEFAULT_PATH = "/mcp"
 DEFAULT_DAEMONS_DIR = Path.home() / ".nomad" / "daemons"
+PROJECT_PORT_MIN = 49152
+PROJECT_PORT_MAX = 65535
+BEARER_TOKEN_ENV_VAR = "NOMAD_MCP_BEARER_TOKEN"
 START_TIMEOUT_SECONDS = 10.0
 STOP_TIMEOUT_SECONDS = 5.0
 POLL_INTERVAL_SECONDS = 0.1
@@ -45,12 +50,14 @@ def start_daemon(
     *,
     project: str | os.PathLike[str] | None = None,
     host: str = DEFAULT_HOST,
-    port: int = DEFAULT_PORT,
+    port: int | None = None,
     path: str = DEFAULT_PATH,
     allow_remote: bool = False,
 ) -> dict[str, Any]:
     """Starts one persistent Nomad daemon for a project, idempotently."""
     project_root = resolve_project(project)
+    if port is None:
+        port = project_default_port(project_root)
     _validate_endpoint(host, port, path)
     host = host.strip()
     if not is_loopback_host(host):
@@ -71,6 +78,7 @@ def start_daemon(
             host=host,
             port=port,
             path=path,
+            allow_remote=allow_remote,
         )
 
 
@@ -126,8 +134,17 @@ def restart_daemon(
         state = _read_state(paths["state"], project_root)
         endpoint = {
             "host": state.get("host", DEFAULT_HOST) if state else DEFAULT_HOST,
-            "port": state.get("port", DEFAULT_PORT) if state else DEFAULT_PORT,
+            "port": (
+                state.get("port", project_default_port(project_root))
+                if state
+                else project_default_port(project_root)
+            ),
             "path": state.get("path", DEFAULT_PATH) if state else DEFAULT_PATH,
+            "allow_remote": (
+                bool(state.get("allow_remote", not is_loopback_host(state["host"])))
+                if state
+                else False
+            ),
         }
         if state is not None:
             _stop_locked(
@@ -149,6 +166,14 @@ def resolve_project(project: str | os.PathLike[str] | None = None) -> Path:
     if not resolved.is_dir():
         raise DaemonError(f"project path is not a directory: {resolved}")
     return resolved
+
+
+def project_default_port(project: str | os.PathLike[str] | Path) -> int:
+    """Maps a resolved project path to a stable private-use high port."""
+    project_root = Path(project).expanduser().resolve(strict=True)
+    digest = hashlib.sha256(os.fsencode(str(project_root))).digest()
+    port_count = PROJECT_PORT_MAX - PROJECT_PORT_MIN + 1
+    return PROJECT_PORT_MIN + int.from_bytes(digest[:8], "big") % port_count
 
 
 def is_loopback_host(host: str) -> bool:
@@ -181,6 +206,7 @@ def _start_locked(
     host: str,
     port: int,
     path: str,
+    allow_remote: bool,
 ) -> dict[str, Any]:
     existing = _read_state(paths["state"], project_root)
     if existing is not None:
@@ -212,6 +238,10 @@ def _start_locked(
     ]
     env = os.environ.copy()
     env["NOMAD_MCP_LOG_PATH"] = str(paths["log"])
+    bearer_token = _read_or_create_token(paths["token"])
+    env[BEARER_TOKEN_ENV_VAR] = bearer_token
+    if allow_remote:
+        command.append("--allow-remote")
 
     log_handle = _open_secure_append(paths["log"])
     try:
@@ -250,6 +280,9 @@ def _start_locked(
         "started_at": datetime.now(timezone.utc).isoformat(),
         "instance_id": instance_id,
         "log_path": str(paths["log"]),
+        "allow_remote": allow_remote,
+        "auth": True,
+        "token_env_var": _project_token_env_var(project_root),
     }
     _write_state(paths["state"], state)
     return _running_result(state, already_running=False)
@@ -312,12 +345,21 @@ def _stop_locked(
 
 def _project_paths(project_root: Path) -> dict[str, Path]:
     daemon_dir = _ensure_daemon_dir()
-    project_hash = hashlib.sha256(os.fsencode(str(project_root))).hexdigest()
+    project_hash = _project_hash(project_root)
     return {
         "state": daemon_dir / f"{project_hash}.json",
         "lock": daemon_dir / f"{project_hash}.lock",
         "log": daemon_dir / f"{project_hash}.log",
+        "token": daemon_dir / f"{project_hash}.token",
     }
+
+
+def _project_hash(project_root: Path) -> str:
+    return hashlib.sha256(os.fsencode(str(project_root))).hexdigest()
+
+
+def _project_token_env_var(project_root: Path) -> str:
+    return f"{BEARER_TOKEN_ENV_VAR}_{_project_hash(project_root)[:16].upper()}"
 
 
 def _ensure_daemon_dir() -> Path:
@@ -342,6 +384,56 @@ def _open_secure_append(path: Path):
     fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
     os.chmod(path, 0o600)
     return os.fdopen(fd, "ab", buffering=0)
+
+
+def _read_or_create_token(path: Path) -> str:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    token = secrets.token_urlsafe(32)
+    try:
+        fd = os.open(path, flags, 0o600)
+    except FileExistsError:
+        return _read_token(path)
+
+    try:
+        with os.fdopen(fd, "w", encoding="ascii") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            handle.write(token)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    return token
+
+
+def _read_token(path: Path) -> str:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise DaemonError("cannot read daemon authentication token") from exc
+    try:
+        with os.fdopen(fd, "r", encoding="ascii") as handle:
+            metadata = os.fstat(handle.fileno())
+            if not stat.S_ISREG(metadata.st_mode):
+                raise DaemonError(
+                    "daemon authentication token is not a regular file"
+                )
+            os.fchmod(handle.fileno(), 0o600)
+            token = handle.read().strip()
+    except (OSError, UnicodeError) as exc:
+        raise DaemonError("cannot read daemon authentication token") from exc
+    if not token or any(character.isspace() for character in token):
+        raise DaemonError("daemon authentication token file is invalid")
+    return token
 
 
 def _write_state(path: Path, state: Mapping[str, Any]) -> None:
@@ -418,6 +510,15 @@ def _valid_state(payload: Any, project_root: Path) -> bool:
         return False
     if not payload["instance_id"].strip():
         return False
+    for optional_key, expected_type in {
+        "allow_remote": bool,
+        "auth": bool,
+        "token_env_var": str,
+    }.items():
+        if optional_key in payload and not isinstance(
+            payload[optional_key], expected_type
+        ):
+            return False
     return True
 
 
@@ -569,6 +670,24 @@ def _build_url(host: str, port: int, path: str) -> str:
     return f"http://{rendered_host}:{port}{path}"
 
 
+_PUBLIC_STATE_FIELDS = (
+    "schema_version",
+    "pid",
+    "project_root",
+    "host",
+    "port",
+    "path",
+    "url",
+    "version",
+    "started_at",
+    "instance_id",
+    "log_path",
+    "allow_remote",
+    "auth",
+    "token_env_var",
+)
+
+
 def _running_result(
     state: Mapping[str, Any], *, already_running: bool
 ) -> dict[str, Any]:
@@ -576,7 +695,7 @@ def _running_result(
         "status": "running",
         "running": True,
         "already_running": already_running,
-        **dict(state),
+        **{key: state[key] for key in _PUBLIC_STATE_FIELDS if key in state},
     }
 
 
