@@ -34,6 +34,26 @@ AUTH_RE = re.compile(
     r"((?:authorization|auth_token)\s*(?::|=)\s*(?:Bearer|Basic|Token)\s+)[^\s]+",
     re.IGNORECASE,
 )
+ASSIGNMENT_RE = re.compile(
+    r"""
+    (?P<key_quote>["']?)
+    (?P<key>[A-Za-z_][A-Za-z0-9_.-]*)
+    (?P=key_quote)
+    (?P<separator>\s*(?:=|:)\s*)
+    (?P<value>
+        "(?:\\.|[^"\\])*"
+        |
+        '(?:\\.|[^'\\])*'
+        |
+        (?:Bearer|Basic|Token)\s+[^\s,;}\]]+
+        |
+        \[[^\]\r\n]*\]
+        |
+        [^\s,;}\]]+
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
 
 _LOGGER: logging.Logger | None = None
 
@@ -135,8 +155,70 @@ def format_traceback(exc: BaseException) -> str:
 def redact_text(value: str) -> str:
     """Redacts common credentials from text before it reaches MCP logs or diagnostics."""
     redacted = USERINFO_RE.sub(r"\1***:***@", value)
+    redacted = _redact_sensitive_assignments(redacted)
     redacted = AUTH_RE.sub(r"\1[REDACTED]", redacted)
     return redacted
+
+
+def _redact_sensitive_assignments(value: str) -> str:
+    pieces: list[str] = []
+    output_position = 0
+    search_position = 0
+    while match := ASSIGNMENT_RE.search(value, search_position):
+        if not _is_sensitive_assignment_key(match.group("key")):
+            search_position = match.start() + 1
+            continue
+        pieces.append(value[output_position:match.start()])
+        pieces.append(_redact_sensitive_assignment(match))
+        output_position = match.end()
+        search_position = match.end()
+    pieces.append(value[output_position:])
+    return "".join(pieces)
+
+
+def _redact_sensitive_assignment(match: re.Match[str]) -> str:
+    key = match.group("key")
+    value = match.group("value")
+    if value.strip("\"'") == "[REDACTED]":
+        return match.group(0)
+    replacement = "[REDACTED]"
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        replacement = f"{value[0]}{replacement}{value[-1]}"
+    return (
+        f"{match.group('key_quote')}{key}{match.group('key_quote')}"
+        f"{match.group('separator')}{replacement}"
+    )
+
+
+def _is_sensitive_assignment_key(key: str) -> bool:
+    normalized = re.sub(r"[^A-Za-z0-9]+", "_", key).strip("_").upper()
+    parts = tuple(part for part in normalized.split("_") if part)
+    if normalized in {
+        "API_KEY",
+        "API_TOKEN",
+        "AUTH",
+        "AUTHORIZATION",
+        "CREDENTIAL",
+        "CREDENTIALS",
+        "PASSWORD",
+        "PASSWD",
+        "SECRET",
+    }:
+        return True
+    return any(
+        part
+        in {
+            "AUTH",
+            "AUTHORIZATION",
+            "CREDENTIAL",
+            "CREDENTIALS",
+            "PASSWORD",
+            "PASSWD",
+            "SECRET",
+            "TOKEN",
+        }
+        for part in parts
+    )
 
 
 def _logger_points_to(logger: logging.Logger, log_path: Path) -> bool:

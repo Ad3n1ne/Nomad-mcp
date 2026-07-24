@@ -60,19 +60,20 @@ def start_daemon(
     allow_remote: bool = False,
 ) -> dict[str, Any]:
     """Starts one persistent Nomad daemon for a project, idempotently."""
+    if allow_remote:
+        raise DaemonError(
+            "--allow-remote is not supported; Nomad 0.2.0 HTTP daemons are "
+            "restricted to loopback until TLS support is available"
+        )
     project_root = resolve_project(project)
     if port is None:
         port = project_default_port(project_root)
     _validate_endpoint(host, port, path)
     host = host.strip()
     if not is_loopback_host(host):
-        if not allow_remote:
-            raise DaemonError(
-                f"refusing non-loopback host {host!r}; pass --allow-remote explicitly"
-            )
-        print(
-            f"warning: Nomad daemon will listen on non-loopback host {host!r}",
-            file=sys.stderr,
+        raise DaemonError(
+            f"refusing non-loopback host {host!r}; Nomad 0.2.0 HTTP daemons "
+            "are restricted to loopback until TLS support is available"
         )
 
     paths = _project_paths(project_root)
@@ -83,7 +84,6 @@ def start_daemon(
             host=host,
             port=port,
             path=path,
-            allow_remote=allow_remote,
         )
 
 
@@ -137,19 +137,19 @@ def restart_daemon(
     paths = _project_paths(project_root)
     with _project_lock(paths["lock"]):
         state = _read_state(paths["state"], project_root)
+        recorded_host = state.get("host", DEFAULT_HOST) if state else DEFAULT_HOST
         endpoint = {
-            "host": state.get("host", DEFAULT_HOST) if state else DEFAULT_HOST,
+            "host": (
+                recorded_host
+                if isinstance(recorded_host, str) and is_loopback_host(recorded_host)
+                else DEFAULT_HOST
+            ),
             "port": (
                 state.get("port", project_default_port(project_root))
                 if state
                 else project_default_port(project_root)
             ),
             "path": state.get("path", DEFAULT_PATH) if state else DEFAULT_PATH,
-            "allow_remote": (
-                bool(state.get("allow_remote", not is_loopback_host(state["host"])))
-                if state
-                else False
-            ),
         }
         if state is not None:
             _stop_locked(
@@ -226,8 +226,12 @@ def _start_locked(
     host: str,
     port: int,
     path: str,
-    allow_remote: bool,
 ) -> dict[str, Any]:
+    if not is_loopback_host(host):
+        raise DaemonError(
+            "Nomad 0.2.0 HTTP daemons are restricted to loopback until "
+            "TLS support is available"
+        )
     existing = _read_state(paths["state"], project_root)
     if existing is not None:
         pid = int(existing["pid"])
@@ -260,8 +264,6 @@ def _start_locked(
     env["NOMAD_MCP_LOG_PATH"] = str(paths["log"])
     bearer_token = _read_or_create_token(paths["token"])
     env[BEARER_TOKEN_ENV_VAR] = bearer_token
-    if allow_remote:
-        command.append("--allow-remote")
 
     log_handle = _open_secure_append(paths["log"])
     try:
@@ -292,7 +294,7 @@ def _start_locked(
             "started_at": datetime.now(timezone.utc).isoformat(),
             "instance_id": instance_id,
             "log_path": str(paths["log"]),
-            "allow_remote": allow_remote,
+            "allow_remote": False,
             "auth": True,
             "token_env_var": _project_token_env_var(project_root),
             "lifecycle": "starting",

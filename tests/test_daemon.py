@@ -436,23 +436,39 @@ def test_default_project_ports_are_stable_and_isolated(tmp_path):
     assert first_port != second_port
 
 
-def test_non_loopback_requires_explicit_allow_remote(
-    daemon_home, project, monkeypatch, capsys
-):
-    with pytest.raises(daemon.DaemonError, match="--allow-remote"):
+def test_non_loopback_and_legacy_allow_remote_are_rejected(daemon_home, project):
+    with pytest.raises(daemon.DaemonError, match="restricted to loopback"):
         daemon.start_daemon(project=project, host="0.0.0.0")
 
-    _, popen_calls = _mock_successful_start(monkeypatch)
-    result = daemon.start_daemon(
-        project=project,
-        host="0.0.0.0",
-        allow_remote=True,
+    with pytest.raises(daemon.DaemonError, match="not supported"):
+        daemon.start_daemon(project=project, allow_remote=True)
+
+
+def test_restart_legacy_remote_state_falls_back_to_loopback(
+    daemon_home, project, monkeypatch
+):
+    paths, payload = _state(project)
+    payload.update(
+        {
+            "host": "0.0.0.0",
+            "url": "http://0.0.0.0:8765/mcp",
+            "allow_remote": True,
+        }
+    )
+    daemon._write_state(paths["state"], payload)
+    starts = []
+    monkeypatch.setattr(daemon, "_stop_locked", lambda **kwargs: None)
+    monkeypatch.setattr(
+        daemon,
+        "_start_locked",
+        lambda **kwargs: starts.append(kwargs) or {"status": "running"},
     )
 
-    assert result["host"] == "0.0.0.0"
-    assert result["allow_remote"] is True
-    assert "--allow-remote" in popen_calls[0][0]
-    assert "warning:" in capsys.readouterr().err
+    result = daemon.restart_daemon(project=project)
+
+    assert result["restarted"] is True
+    assert starts[0]["host"] == daemon.DEFAULT_HOST
+    assert "allow_remote" not in starts[0]
 
 
 def test_start_rejects_an_address_already_in_use(

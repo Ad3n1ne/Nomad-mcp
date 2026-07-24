@@ -113,9 +113,9 @@ nomad daemon stop --project "$PWD"
 
 升级 nomad 后，需要重启所有正在运行的项目 daemon，让常驻进程加载新代码。
 
-默认只监听 loopback。绑定非 loopback 地址必须显式传入 `--allow-remote`，并且
-仍然强制 bearer 认证。Nomad 可以同步文件和执行远端命令，除非网络和客户端都
-可信，否则不要暴露到本机之外。
+Nomad 0.2.0 的 HTTP 服务只允许监听 loopback 地址。`nomad serve`、
+`nomad daemon start` 和 server API 即使配置了 bearer token，也会拒绝
+non-loopback host。远程监听要等未来加入 TLS 传输支持后再开放。
 
 ### 兼容 stdio 模式
 
@@ -243,6 +243,8 @@ nomad client-config --transport stdio --name nomad
 - 每个 Codex task 首次调用 Nomad 前，先调用 `health`。
 - `run_remote` 只用于短同步探针和短命令。
 - 上传、编译、训练、服务进程、扫描、批处理统一用 `task_start`。
+- 有副作用的调用如果发生客户端超时，不要立刻重试；先检查远端状态或任务状态，
+  避免同一操作执行两次。
 - 从 stdio 迁移到常驻 HTTP daemon 后，Codex 的 stdio 子进程 transport 即使失效，
   也不会再连带终止 Nomad 服务和服务状态。
 - HTTP 不能消除所有断连：Codex、本机网络栈或 daemon 自身仍可能重启。此时先让

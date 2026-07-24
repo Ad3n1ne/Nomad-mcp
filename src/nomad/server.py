@@ -103,9 +103,13 @@ def _safe_tool(func: Callable[..., str]) -> Callable[..., Awaitable[str]]:
         )
         try:
             call = functools.partial(func, *args, **kwargs)
-            result = await anyio.to_thread.run_sync(call, abandon_on_cancel=True)
+            result = await anyio.to_thread.run_sync(call, abandon_on_cancel=False)
+            await anyio.lowlevel.checkpoint()
         except anyio.get_cancelled_exc_class():
-            logger.info("tool cancelled name=%s", tool_name)
+            logger.info(
+                "tool request cancellation observed after worker completion name=%s",
+                tool_name,
+            )
             raise
         except BaseException as exc:
             target = kwargs.get("target") if isinstance(kwargs.get("target"), str) else None
@@ -149,9 +153,13 @@ def _safe_resource(func: Callable[..., str]) -> Callable[..., Awaitable[str]]:
         )
         try:
             call = functools.partial(func, *args, **kwargs)
-            result = await anyio.to_thread.run_sync(call, abandon_on_cancel=True)
+            result = await anyio.to_thread.run_sync(call, abandon_on_cancel=False)
+            await anyio.lowlevel.checkpoint()
         except anyio.get_cancelled_exc_class():
-            logger.info("resource cancelled name=%s", resource_name)
+            logger.info(
+                "resource request cancellation observed after worker completion name=%s",
+                resource_name,
+            )
             raise
         except BaseException as exc:
             exc_summary = redact_text(f"{type(exc).__name__}: {exc}")
@@ -301,8 +309,11 @@ def create_server(
         not isinstance(bearer_token, str) or not bearer_token
     ):
         raise ValueError("bearer token must be a non-empty string")
-    if not is_loopback_host(host) and bearer_token is None:
-        raise ValueError("non-loopback hosts require bearer authentication")
+    if not is_loopback_host(host):
+        raise ValueError(
+            "Nomad 0.2.0 only supports loopback HTTP hosts; "
+            "remote binding requires a future TLS-enabled release"
+        )
 
     endpoint_url = _endpoint_url(host, port, path)
     auth = None
@@ -356,6 +367,11 @@ def main(
     bearer_token: str | None = None,
 ) -> None:
     """Server CLI Entry."""
+    if not is_loopback_host(host):
+        raise ValueError(
+            "Nomad 0.2.0 only supports loopback HTTP hosts; "
+            "remote binding requires a future TLS-enabled release"
+        )
     log_server_startup(os.getcwd(), __version__)
     atexit.register(log_server_shutdown)
     try:

@@ -48,14 +48,12 @@ def main(argv: list[str] | None = None) -> int | None:
     if args.command == "serve":
         from nomad.server import is_loopback_host, main as server_main
 
-        if not is_loopback_host(args.host) and not args.allow_remote:
-            parser.error("serve on a non-loopback host requires --allow-remote")
-        bearer_token = os.environ.get("NOMAD_MCP_BEARER_TOKEN") or None
-        if not is_loopback_host(args.host) and bearer_token is None:
+        if not is_loopback_host(args.host):
             parser.error(
-                "serve on a non-loopback host requires "
-                "NOMAD_MCP_BEARER_TOKEN"
+                "serve only supports loopback hosts in Nomad 0.2.0; "
+                "remote binding requires a future TLS-enabled release"
             )
+        bearer_token = os.environ.get("NOMAD_MCP_BEARER_TOKEN") or None
 
         server_main(
             transport="streamable-http",
@@ -147,11 +145,6 @@ def _build_parser() -> argparse.ArgumentParser:
         default="/mcp",
         help="Streamable HTTP endpoint path (default: /mcp).",
     )
-    serve_parser.add_argument(
-        "--allow-remote",
-        action="store_true",
-        help="Explicitly allow a non-loopback listen host; bearer authentication is still required.",
-    )
     serve_parser.add_argument("--daemon-id", help=argparse.SUPPRESS)
 
     daemon_parser = subparsers.add_parser(
@@ -181,11 +174,6 @@ def _build_parser() -> argparse.ArgumentParser:
         type=_valid_path,
         default="/mcp",
         help="Streamable HTTP endpoint path (default: /mcp).",
-    )
-    daemon_start_parser.add_argument(
-        "--allow-remote",
-        action="store_true",
-        help="Explicitly allow a non-loopback listen host.",
     )
     for daemon_command in ("status", "restart", "stop"):
         command_parser = daemon_subparsers.add_parser(
@@ -229,7 +217,6 @@ def _run_daemon_command(args: argparse.Namespace) -> int:
                 host=args.host,
                 port=args.port,
                 path=args.path,
-                allow_remote=args.allow_remote,
             )
         elif args.daemon_command == "status":
             result = status_daemon(project=args.project)

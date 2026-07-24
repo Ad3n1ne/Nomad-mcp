@@ -125,11 +125,10 @@ nomad daemon stop --project "$PWD"
 After upgrading nomad, restart every running project daemon so the persistent
 process loads the new code.
 
-The default bind address is loopback-only. A non-loopback bind requires
-`--allow-remote` and bearer authentication remains mandatory. Exposing Nomad
-outside the local machine grants access to tools that can sync files and execute
-remote commands, so keep it on loopback unless the network and clients are
-trusted.
+Nomad 0.2.0 accepts HTTP binds only on loopback addresses. `nomad serve`,
+`nomad daemon start`, and the server API reject non-loopback hosts even when a
+bearer token is configured. Remote binds may be added in a future release after
+TLS transport support is available.
 
 ### Compatible stdio mode
 
@@ -259,6 +258,9 @@ remote tmux session and can be checked later.
 - Call `health` before the first Nomad tool call in each Codex task.
 - Use `run_remote` only for short synchronous probes and commands.
 - Use `task_start` for uploads, builds, training, servers, scans, or batch work.
+- If a client times out during a call with side effects, do not immediately retry
+  it. Check the remote or task status first to avoid performing the operation
+  twice.
 - Moving from stdio to the persistent HTTP daemon prevents a broken Codex stdio
   child transport from taking the Nomad server and its state down with it.
 - HTTP cannot prevent every disconnect: Codex, the local network stack, or the

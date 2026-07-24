@@ -2,7 +2,6 @@ import inspect
 import json
 import os
 import threading
-import time
 
 import anyio
 import httpx
@@ -87,9 +86,10 @@ def test_create_server_rejects_invalid_path(path):
 
 
 @pytest.mark.parametrize("host", ["0.0.0.0", "::", "192.168.1.25", "nomad.local"])
-def test_create_server_rejects_unauthenticated_non_loopback_host(host):
-    with pytest.raises(ValueError, match="bearer"):
-        create_server(host=host)
+@pytest.mark.parametrize("bearer_token", [None, "test-token"])
+def test_create_server_rejects_non_loopback_host(host, bearer_token):
+    with pytest.raises(ValueError, match="only supports loopback"):
+        create_server(host=host, bearer_token=bearer_token)
 
 
 @pytest.mark.parametrize("host", ["127.0.0.1", "::1", "[::1]", "localhost", "LOCALHOST."])
@@ -97,11 +97,21 @@ def test_is_loopback_host(host):
     assert is_loopback_host(host) is True
 
 
-def test_create_server_accepts_authenticated_non_loopback_host():
-    server = create_server(host="0.0.0.0", bearer_token="test-token")
+def test_server_main_rejects_non_loopback_before_creating_server(monkeypatch):
+    created = []
+    monkeypatch.setattr(
+        "nomad.server.create_server",
+        lambda **kwargs: created.append(kwargs),
+    )
 
-    assert server.settings.auth is not None
-    assert server._token_verifier is not None
+    with pytest.raises(ValueError, match="only supports loopback"):
+        main(
+            transport="streamable-http",
+            host="0.0.0.0",
+            bearer_token="test-token",
+        )
+
+    assert created == []
 
 
 def test_server_main_defaults_to_stdio(monkeypatch):
@@ -226,6 +236,31 @@ def test_safe_tool_catches_exception_and_logs_traceback(tmp_path, monkeypatch):
     assert "Traceback" in log_content
 
 
+def test_safe_tool_redacts_sensitive_exception_and_traceback(tmp_path, monkeypatch):
+    log_path = tmp_path / "nomad-mcp.log"
+    monkeypatch.setenv("NOMAD_MCP_LOG_PATH", str(log_path))
+    secrets = {
+        "API_TOKEN": "api-token-value",
+        "PASSWORD": "password-value",
+        "AWS_SECRET_ACCESS_KEY": "aws-secret-value",
+        "API_KEY": "api-key-value",
+        "AUTH": "auth-value",
+        "CREDENTIAL": "credential-value",
+    }
+
+    def boom() -> str:
+        message = " ".join(f"{key}={value}" for key, value in secrets.items())
+        raise RuntimeError(message)
+
+    result = json.loads(run_async(_safe_tool(boom)))
+
+    log_content = log_path.read_text(encoding="utf-8")
+    assert all(secret not in log_content for secret in secrets.values())
+    assert all(secret not in result["diagnostics"][0] for secret in secrets.values())
+    assert "API_TOKEN=[REDACTED]" in log_content
+    assert "AWS_SECRET_ACCESS_KEY=[REDACTED]" in log_content
+
+
 def test_safe_tool_redacts_sensitive_params_from_log(tmp_path, monkeypatch):
     log_path = tmp_path / "nomad-mcp.log"
     monkeypatch.setenv("NOMAD_MCP_LOG_PATH", str(log_path))
@@ -283,28 +318,52 @@ def test_wrapper_cancellation_is_not_structured_as_internal_error(
     monkeypatch.setenv("NOMAD_MCP_LOG_PATH", str(log_path))
     started = threading.Event()
     release = threading.Event()
+    cancellation_observed = threading.Event()
+    cancelled_before_release = []
+    events = []
 
     def blocking() -> str:
         started.set()
         release.wait(timeout=2)
+        events.append("worker completed")
         return "{}"
 
     wrapped = wrapper_factory(blocking)
 
     async def scenario():
-        before = time.monotonic()
-        with anyio.move_on_after(0.1) as scope:
-            await wrapped()
-        assert scope.cancel_called
-        assert time.monotonic() - before < 0.5
+        async def invoke():
+            try:
+                await wrapped()
+            except anyio.get_cancelled_exc_class():
+                events.append("cancellation propagated")
+                cancellation_observed.set()
+                raise
+
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(invoke)
+            while not started.is_set():
+                await anyio.sleep(0.01)
+
+            def release_worker():
+                cancelled_before_release.append(cancellation_observed.is_set())
+                release.set()
+
+            threading.Timer(0.1, release_worker).start()
+            task_group.cancel_scope.cancel()
 
     try:
         anyio.run(scenario)
     finally:
         release.set()
 
+    assert cancelled_before_release == [False]
+    assert events == ["worker completed", "cancellation propagated"]
     log_content = log_path.read_text(encoding="utf-8")
-    assert f"{entry_kind} cancelled name=blocking" in log_content
+    assert (
+        f"{entry_kind} request cancellation observed after worker completion "
+        "name=blocking"
+    ) in log_content
+    assert f"{entry_kind} cancelled name=blocking" not in log_content
     assert f"{entry_kind} exception name=blocking" not in log_content
 
 
