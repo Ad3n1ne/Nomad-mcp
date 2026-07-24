@@ -106,3 +106,4 @@ Modern AI development paradigms (Cursor Agent, Claude Code, Trae, etc.) only per
 | `06-workspace-isolation.md` | Workspace isolation mechanism |
 | `07-dev-plan.md` | Phased development plan, technology choices, risk mitigations |
 | `08-implementation-spec.md` | Pre-coding implementation spec (return contracts, state machine, security boundaries, testing requirements) |
+| `09-persistent-daemon.md` | Persistent Streamable HTTP daemon setup, lifecycle, security, and troubleshooting |
