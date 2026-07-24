@@ -162,6 +162,21 @@ def restart_daemon(
         return result
 
 
+def read_daemon_token(
+    *, project: str | os.PathLike[str] | None = None
+) -> str:
+    """Reads the project daemon bearer token without exposing its path."""
+    project_root = resolve_project(project)
+    paths = _project_paths(project_root)
+    with _project_lock(paths["lock"]):
+        if not paths["token"].exists():
+            raise DaemonError(
+                "daemon authentication token is not initialized; "
+                "run 'nomad daemon start' for this project first"
+            )
+        return _read_token(paths["token"])
+
+
 def resolve_project(project: str | os.PathLike[str] | None = None) -> Path:
     candidate = Path.cwd() if project is None else Path(project).expanduser()
     try:

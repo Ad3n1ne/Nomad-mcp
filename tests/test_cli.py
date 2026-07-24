@@ -1,5 +1,6 @@
 import json
 import subprocess
+import tomllib
 
 import pytest
 
@@ -50,6 +51,144 @@ def test_cli_client_config_installed_toml(capsys):
     out = capsys.readouterr().out
     assert 'command = "nomad"' in out
     assert "args = []" in out
+
+
+def test_cli_client_config_stdio_custom_name_keeps_compatible_output(capsys):
+    assert main(["client-config", "--name", "nomad_project-1"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "mcpServers": {
+            "nomad_project-1": {
+                "command": "uvx",
+                "args": ["nomad-mcp"],
+            }
+        }
+    }
+
+
+def test_cli_client_config_http_json(monkeypatch, capsys):
+    monkeypatch.setattr(
+        daemon,
+        "status_daemon",
+        lambda **kwargs: {
+            "status": "running",
+            "running": True,
+            "project_root": "/tmp/project",
+            "url": "http://127.0.0.1:54321/mcp",
+            "token_env_var": "NOMAD_MCP_BEARER_TOKEN_ABC123",
+            "token": "must-not-leak",
+            "token_path": "/must/not/leak",
+        },
+    )
+
+    assert main(
+        [
+            "client-config",
+            "--transport",
+            "http",
+            "--project",
+            "/tmp/project",
+            "--name",
+            "nomad-project",
+        ]
+    ) == 0
+
+    output = capsys.readouterr().out
+    assert "must-not-leak" not in output
+    assert "/must/not/leak" not in output
+    assert json.loads(output) == {
+        "mcpServers": {
+            "nomad-project": {
+                "url": "http://127.0.0.1:54321/mcp",
+                "bearerTokenEnvVar": "NOMAD_MCP_BEARER_TOKEN_ABC123",
+            }
+        }
+    }
+
+
+def test_cli_client_config_http_toml(monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(
+        daemon,
+        "status_daemon",
+        lambda **kwargs: calls.append(kwargs)
+        or {
+            "status": "running",
+            "running": True,
+            "url": "http://127.0.0.1:54321/mcp",
+            "token_env_var": "NOMAD_MCP_BEARER_TOKEN_ABC123",
+        },
+    )
+
+    assert main(
+        [
+            "client-config",
+            "--transport",
+            "http",
+            "--project",
+            "/tmp/project",
+            "--name",
+            "nomad_project",
+            "--format",
+            "toml",
+        ]
+    ) == 0
+
+    assert calls == [{"project": "/tmp/project"}]
+    rendered = capsys.readouterr().out
+    assert tomllib.loads(rendered) == {
+        "mcp_servers": {
+            "nomad_project": {
+                "url": "http://127.0.0.1:54321/mcp",
+                "bearer_token_env_var": "NOMAD_MCP_BEARER_TOKEN_ABC123",
+            }
+        }
+    }
+
+
+@pytest.mark.parametrize("name", ["nomad.project", "nomad project", "x/y", ""])
+def test_cli_client_config_rejects_invalid_name(name):
+    with pytest.raises(SystemExit):
+        main(["client-config", "--name", name])
+
+
+@pytest.mark.parametrize(
+    ("status", "error_type"),
+    [
+        ("stopped", "daemon_not_running"),
+        ("starting", "daemon_starting"),
+        ("ownership_mismatch", "daemon_ownership_mismatch"),
+    ],
+)
+def test_cli_client_config_http_requires_running_daemon(
+    monkeypatch, capsys, status, error_type
+):
+    monkeypatch.setattr(
+        daemon,
+        "status_daemon",
+        lambda **kwargs: {
+            "status": status,
+            "running": False,
+            "project_root": "/tmp/project",
+        },
+    )
+
+    assert main(["client-config", "--transport", "http"]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    error = json.loads(captured.err)
+    assert error == {
+        "ok": False,
+        "error_type": error_type,
+        "message": (
+            f"project daemon is {status}; "
+            "run 'nomad daemon start --project <project>' first"
+        ),
+        "status": status,
+        "project_root": "/tmp/project",
+    }
 
 
 def test_cli_serve_uses_streamable_http_defaults(monkeypatch):
@@ -254,6 +393,39 @@ def test_cli_daemon_error_is_reported_without_traceback(monkeypatch, capsys):
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err.strip() == "error: daemon unavailable"
+
+
+def test_cli_daemon_token_prints_only_secret(monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(
+        daemon,
+        "read_daemon_token",
+        lambda **kwargs: calls.append(kwargs) or "project-secret",
+    )
+
+    assert main(["daemon", "token", "--project", "/tmp/project"]) == 0
+
+    captured = capsys.readouterr()
+    assert calls == [{"project": "/tmp/project"}]
+    assert captured.out == "project-secret\n"
+    assert captured.err == ""
+
+
+def test_cli_daemon_token_reports_uninitialized_without_stdout(
+    monkeypatch, capsys
+):
+    def fail(**kwargs):
+        raise daemon.DaemonError("daemon authentication token is not initialized")
+
+    monkeypatch.setattr(daemon, "read_daemon_token", fail)
+
+    assert main(["daemon", "token"]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == (
+        "error: daemon authentication token is not initialized\n"
+    )
 
 
 def test_cli_doctor_success(monkeypatch, capsys):

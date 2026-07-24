@@ -4,7 +4,7 @@
 
 nomad 是一个运行在本地的 MCP Server，用来打通“本地写代码 + 远端验证运行”的 Agentic 远程开发工作流。
 
-只要你的智能体开发环境支持通过 command + args 启动 stdio MCP server，就可以接入 nomad。
+Codex 推荐使用按项目常驻的 Streamable HTTP daemon。stdio 模式继续保留，用于兼容旧客户端和一次性调用。
 
 ## 特性
 
@@ -48,7 +48,79 @@ pipx install nomad-mcp
 
 ## MCP 客户端配置
 
-不同 MCP 客户端的配置文件位置不同。
+### 推荐方式：常驻 HTTP daemon
+
+在每个本地项目中启动一个 daemon：
+
+```bash
+nomad daemon start --project "$PWD"
+nomad daemon status --project "$PWD"
+```
+
+`status` 会返回该项目专属的 `url` 和 `token_env_var`。推荐通过这个环境变量
+配置 bearer token，而不是把 token 内联到客户端配置。`daemon token` 只向
+stdout 写入 secret，便于 shell substitution；请把输出当作凭据，不要写入日志。
+
+生成引用该环境变量的 Codex TOML 配置：
+
+```bash
+nomad client-config \
+  --transport http \
+  --project "$PWD" \
+  --name nomad-myproject \
+  --format toml
+```
+
+也可以用 Codex CLI 直接注册。先从 `status` 读取非敏感的连接信息：
+
+```bash
+NOMAD_PROJECT="$PWD"
+NOMAD_STATUS="$(nomad daemon status --project "$NOMAD_PROJECT")"
+NOMAD_URL="$(python -c 'import json,sys; print(json.load(sys.stdin)["url"])' <<<"$NOMAD_STATUS")"
+NOMAD_TOKEN_ENV_VAR="$(python -c 'import json,sys; print(json.load(sys.stdin)["token_env_var"])' <<<"$NOMAD_STATUS")"
+codex mcp add nomad-myproject \
+  --url "$NOMAD_URL" \
+  --bearer-token-env-var "$NOMAD_TOKEN_ENV_VAR"
+```
+
+使用 Codex CLI，或者从终端启动 Codex 时，在同一个 shell 中导出 token 后再启动：
+
+```bash
+export "$NOMAD_TOKEN_ENV_VAR=$(nomad daemon token --project "$NOMAD_PROJECT")"
+codex
+```
+
+macOS 上使用 Codex Desktop 时，把变量写入当前 GUI 登录会话：
+
+```bash
+launchctl setenv "$NOMAD_TOKEN_ENV_VAR" "$(nomad daemon token --project "$NOMAD_PROJECT")"
+```
+
+然后完全退出 Codex Desktop 并重新打开，让新进程继承该变量。这个 `launchctl`
+值属于当前登录会话，注销账号或重启 Mac 后可能需要重新设置。
+
+每个项目都有稳定的独立高位端口、独立 token 环境变量和独立 daemon 状态。
+多个项目应使用不同 MCP 名称，例如 `nomad-api`、`nomad-dataset`，并分别注册
+各自 status 返回的 URL。
+
+daemon 生命周期命令：
+
+```bash
+nomad daemon status --project "$PWD"
+nomad daemon restart --project "$PWD"
+nomad daemon stop --project "$PWD"
+```
+
+升级 nomad 后，需要重启所有正在运行的项目 daemon，让常驻进程加载新代码。
+
+默认只监听 loopback。绑定非 loopback 地址必须显式传入 `--allow-remote`，并且
+仍然强制 bearer 认证。Nomad 可以同步文件和执行远端命令，除非网络和客户端都
+可信，否则不要暴露到本机之外。
+
+### 兼容 stdio 模式
+
+`client-config` 默认仍输出 stdio 配置，兼容不支持 Streamable HTTP 的客户端和
+原有用法。
 
 推荐的 PyPI 免安装配置：
 
@@ -108,19 +180,21 @@ startup_timeout_sec = 120
 nomad client-config
 nomad client-config --runner github
 nomad client-config --runner nomad --format toml
+nomad client-config --transport stdio --name nomad
 ```
 
 ## 快速开始
 
-1. 在本地项目目录中打开支持 MCP 的智能体开发环境。
-2. 首次使用 Nomad 工具前先调用 `health`。
-3. 调用 `init_discover` 发现本地项目、SSH alias 和代理环境。
-4. 选择一个 SSH target 和远端工作目录。
-5. 调用 `init_save_config` 保存 `.nomad.json`。
-6. 使用 `sync_push` 把本地代码同步到远端。
-7. 使用 `run_remote` 执行短命令。
-8. 使用 `task_start` 启动长任务，再用 `task_status` 或 `task_list` 查看状态。
-9. 使用 `sync_pull` 拉取远端产物。
+1. 按上面的流程启动并注册项目 HTTP daemon。
+2. 在本地项目目录中打开 Codex。
+3. 首次使用 Nomad 工具前先调用 `health`。
+4. 调用 `init_discover` 发现本地项目、SSH alias 和代理环境。
+5. 选择一个 SSH target 和远端工作目录。
+6. 调用 `init_save_config` 保存 `.nomad.json`。
+7. 使用 `sync_push` 把本地代码同步到远端。
+8. 使用 `run_remote` 执行短命令。
+9. 使用 `task_start` 启动长任务，再用 `task_status` 或 `task_list` 查看状态。
+10. 使用 `sync_pull` 拉取远端产物。
 
 ## 示例 `.nomad.json`
 
@@ -169,8 +243,12 @@ nomad client-config --runner nomad --format toml
 - 每个 Codex task 首次调用 Nomad 前，先调用 `health`。
 - `run_remote` 只用于短同步探针和短命令。
 - 上传、编译、训练、服务进程、扫描、批处理统一用 `task_start`。
-- 如果 Codex 外层报 `Transport closed`，停止在当前 task 里反复重试 Nomad 工具，重启 MCP transport。
-- 本地清理 Codex 拉起后残留的 Nomad MCP 进程：
+- 从 stdio 迁移到常驻 HTTP daemon 后，Codex 的 stdio 子进程 transport 即使失效，
+  也不会再连带终止 Nomad 服务和服务状态。
+- HTTP 不能消除所有断连：Codex、本机网络栈或 daemon 自身仍可能重启。此时先让
+  客户端重连并检查 `daemon status`，仅在 daemon 不健康时重启它。
+- 继续使用旧 stdio 模式时，如果 Codex 外层报 `Transport closed`，停止在当前
+  task 里反复重试并重启 MCP transport。清理 Codex 拉起后残留的 stdio 进程：
 
 ```bash
 nomad doctor --kill-stale-mcp

@@ -6,11 +6,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
 import sys
 from importlib.util import find_spec
+from typing import Any
 
 from nomad import __version__
 from nomad.schema import get_config_schema_hints
@@ -42,8 +44,7 @@ def main(argv: list[str] | None = None) -> int | None:
         print(json.dumps(get_config_schema_hints(), indent=2))
         return 0
     if args.command == "client-config":
-        print(_client_config(args.runner, args.format))
-        return 0
+        return _run_client_config(args)
     if args.command == "serve":
         from nomad.server import is_loopback_host, main as server_main
 
@@ -101,13 +102,29 @@ def _build_parser() -> argparse.ArgumentParser:
         "--runner",
         choices=("uvx", "github", "nomad"),
         default="uvx",
-        help="Use PyPI uvx, GitHub-tag uvx, or an already-installed nomad command.",
+        help="For stdio, use PyPI uvx, GitHub-tag uvx, or an installed nomad command.",
     )
     config_parser.add_argument(
         "--format",
         choices=("json", "toml"),
         default="json",
         help="Output config format.",
+    )
+    config_parser.add_argument(
+        "--transport",
+        choices=("stdio", "http"),
+        default="stdio",
+        help="MCP transport (default: stdio for compatibility).",
+    )
+    config_parser.add_argument(
+        "--project",
+        help="For HTTP, read the daemon endpoint for this project (default: cwd).",
+    )
+    config_parser.add_argument(
+        "--name",
+        type=_valid_mcp_name,
+        default="nomad",
+        help="MCP server name using only letters, digits, '_' or '-' (default: nomad).",
     )
 
     serve_parser = subparsers.add_parser(
@@ -176,6 +193,15 @@ def _build_parser() -> argparse.ArgumentParser:
             help=f"{daemon_command.capitalize()} the project daemon.",
         )
         _add_project_argument(command_parser)
+    daemon_token_parser = daemon_subparsers.add_parser(
+        "token",
+        help="Print the project daemon bearer token (secret) to stdout only.",
+        description=(
+            "Print the project daemon bearer token to stdout only. "
+            "This value is a secret; prefer shell substitution and do not log it."
+        ),
+    )
+    _add_project_argument(daemon_token_parser)
     return parser
 
 
@@ -189,6 +215,7 @@ def _add_project_argument(parser: argparse.ArgumentParser) -> None:
 def _run_daemon_command(args: argparse.Namespace) -> int:
     from nomad.daemon import (
         DaemonError,
+        read_daemon_token,
         restart_daemon,
         start_daemon,
         status_daemon,
@@ -208,6 +235,9 @@ def _run_daemon_command(args: argparse.Namespace) -> int:
             result = status_daemon(project=args.project)
         elif args.daemon_command == "restart":
             result = restart_daemon(project=args.project)
+        elif args.daemon_command == "token":
+            print(read_daemon_token(project=args.project))
+            return 0
         else:
             result = stop_daemon(project=args.project)
     except DaemonError as exc:
@@ -231,6 +261,14 @@ def _valid_port(value: str) -> int:
 def _valid_path(value: str) -> str:
     if not value.startswith("/"):
         raise argparse.ArgumentTypeError("path must start with '/'")
+    return value
+
+
+def _valid_mcp_name(value: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", value):
+        raise argparse.ArgumentTypeError(
+            "name must contain only letters, digits, '_' or '-'"
+        )
     return value
 
 
@@ -328,7 +366,62 @@ def _looks_like_codex_parent(command: str) -> bool:
     return "codex" in lowered or "chatgpt.app" in lowered
 
 
-def _client_config(runner: str, output_format: str) -> str:
+def _run_client_config(args: argparse.Namespace) -> int:
+    try:
+        rendered = _client_config(
+            args.runner,
+            args.format,
+            transport=args.transport,
+            project=args.project,
+            name=args.name,
+        )
+    except ClientConfigError as exc:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error_type": exc.error_type,
+                    "message": str(exc),
+                    **exc.details,
+                },
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+        return 1
+
+    print(rendered)
+    return 0
+
+
+class ClientConfigError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_type: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.error_type = error_type
+        self.details = details or {}
+
+
+def _client_config(
+    runner: str,
+    output_format: str,
+    *,
+    transport: str = "stdio",
+    project: str | None = None,
+    name: str = "nomad",
+) -> str:
+    if transport == "http":
+        return _http_client_config(
+            output_format=output_format,
+            project=project,
+            name=name,
+        )
+
     if runner == "uvx":
         command = "uvx"
         args = [PACKAGE_NAME]
@@ -342,7 +435,7 @@ def _client_config(runner: str, output_format: str) -> str:
     if output_format == "toml":
         rendered_args = ", ".join(json.dumps(arg) for arg in args)
         return (
-            "[mcp_servers.nomad]\n"
+            f"[mcp_servers.{name}]\n"
             f"command = {json.dumps(command)}\n"
             f"args = [{rendered_args}]\n"
             "startup_timeout_sec = 120"
@@ -351,9 +444,81 @@ def _client_config(runner: str, output_format: str) -> str:
     return json.dumps(
         {
             "mcpServers": {
-                "nomad": {
+                name: {
                     "command": command,
                     "args": args,
+                }
+            }
+        },
+        indent=2,
+    )
+
+
+def _http_client_config(
+    *,
+    output_format: str,
+    project: str | None,
+    name: str,
+) -> str:
+    from nomad.daemon import DaemonError, status_daemon
+
+    try:
+        status = status_daemon(project=project)
+    except DaemonError as exc:
+        raise ClientConfigError(
+            str(exc),
+            error_type="daemon_status_failed",
+        ) from exc
+
+    lifecycle = status.get("status")
+    if lifecycle != "running" or status.get("running") is not True:
+        error_type = {
+            "starting": "daemon_starting",
+            "ownership_mismatch": "daemon_ownership_mismatch",
+            "stopped": "daemon_not_running",
+        }.get(str(lifecycle), "daemon_not_running")
+        raise ClientConfigError(
+            f"project daemon is {lifecycle or 'not running'}; "
+            "run 'nomad daemon start --project <project>' first",
+            error_type=error_type,
+            details={
+                key: status[key]
+                for key in ("status", "project_root")
+                if key in status
+            },
+        )
+
+    url = status.get("url")
+    token_env_var = status.get("token_env_var")
+    if (
+        not isinstance(url, str)
+        or not url
+        or not isinstance(token_env_var, str)
+        or not token_env_var
+    ):
+        raise ClientConfigError(
+            "running daemon status is missing its URL or token environment variable",
+            error_type="invalid_daemon_state",
+            details={
+                key: status[key]
+                for key in ("status", "project_root")
+                if key in status
+            },
+        )
+
+    if output_format == "toml":
+        return (
+            f"[mcp_servers.{name}]\n"
+            f"url = {json.dumps(url)}\n"
+            f"bearer_token_env_var = {json.dumps(token_env_var)}"
+        )
+
+    return json.dumps(
+        {
+            "mcpServers": {
+                name: {
+                    "url": url,
+                    "bearerTokenEnvVar": token_env_var,
                 }
             }
         },

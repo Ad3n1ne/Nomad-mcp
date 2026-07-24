@@ -575,6 +575,26 @@ def test_status_uses_public_allowlist_and_never_leaks_token_fields(
     assert "secret" not in json.dumps(result)
 
 
+def test_read_daemon_token_returns_only_existing_secret(
+    daemon_home, project
+):
+    paths = daemon._project_paths(project.resolve())
+    paths["token"].write_text("project-secret\n", encoding="ascii")
+    paths["token"].chmod(0o644)
+
+    result = daemon.read_daemon_token(project=project)
+
+    assert result == "project-secret"
+    assert stat.S_IMODE(paths["token"].stat().st_mode) == 0o600
+
+
+def test_read_daemon_token_requires_initialized_token(
+    daemon_home, project
+):
+    with pytest.raises(daemon.DaemonError, match="not initialized"):
+        daemon.read_daemon_token(project=project)
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
