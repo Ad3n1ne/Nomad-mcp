@@ -26,6 +26,10 @@ Codex 推荐使用按项目常驻的 Streamable HTTP daemon。stdio 模式继续
 - 使用长任务时，远端机器需要安装 `tmux`
 - 远端 target 推荐使用 SSH key 免密登录
 
+persistent daemon 生命周期管理目前支持 macOS、Linux 和其他 POSIX 系统，
+不支持 Windows daemon。stdio transport 不经过 daemon 生命周期，但项目目前
+也没有声明或完成 Windows 支持验证。
+
 ## 安装
 
 使用 PyPI 最新版本时，可以用 `uvx` 直接运行：
@@ -99,9 +103,10 @@ launchctl setenv "$NOMAD_TOKEN_ENV_VAR" "$(nomad daemon token --project "$NOMAD_
 然后完全退出 Codex Desktop 并重新打开，让新进程继承该变量。这个 `launchctl`
 值属于当前登录会话，注销账号或重启 Mac 后可能需要重新设置。
 
-每个项目都有稳定的独立高位端口、独立 token 环境变量和独立 daemon 状态。
-多个项目应使用不同 MCP 名称，例如 `nomad-api`、`nomad-dataset`，并分别注册
-各自 status 返回的 URL。
+每个项目都有持久化的高位端口、独立 token 环境变量和独立 daemon 状态。
+首次启动时，Nomad 会从项目哈希对应的候选端口开始确定性扫描，避开正在监听
+或已被其他项目保留的端口。多个项目应使用不同 MCP 名称，例如 `nomad-api`、
+`nomad-dataset`，并分别注册各自 status 返回的 URL。
 
 daemon 生命周期命令：
 

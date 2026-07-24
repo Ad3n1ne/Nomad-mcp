@@ -39,6 +39,7 @@ PROJECT_PORT_MIN = 49152
 PROJECT_PORT_MAX = 65535
 BEARER_TOKEN_ENV_VAR = "NOMAD_MCP_BEARER_TOKEN"
 START_TIMEOUT_SECONDS = 10.0
+STARTING_RECOVERY_TIMEOUT_SECONDS = 2.0
 STOP_TIMEOUT_SECONDS = 5.0
 POLL_INTERVAL_SECONDS = 0.1
 
@@ -66,9 +67,7 @@ def start_daemon(
             "restricted to loopback until TLS support is available"
         )
     project_root = resolve_project(project)
-    if port is None:
-        port = project_default_port(project_root)
-    _validate_endpoint(host, port, path)
+    _validate_endpoint(host, DEFAULT_PORT if port is None else port, path)
     host = host.strip()
     if not is_loopback_host(host):
         raise DaemonError(
@@ -113,6 +112,7 @@ def status_daemon(
                 "message": "Recorded PID is alive but is not the recorded Nomad daemon instance.",
             }
 
+        state = _recover_starting_state(state, paths)
         return _state_result(state, already_running=True)
 
 
@@ -144,11 +144,7 @@ def restart_daemon(
                 if isinstance(recorded_host, str) and is_loopback_host(recorded_host)
                 else DEFAULT_HOST
             ),
-            "port": (
-                state.get("port", project_default_port(project_root))
-                if state
-                else project_default_port(project_root)
-            ),
+            "port": state.get("port") if state else None,
             "path": state.get("path", DEFAULT_PATH) if state else DEFAULT_PATH,
         }
         if state is not None:
@@ -224,7 +220,7 @@ def _start_locked(
     project_root: Path,
     paths: Mapping[str, Path],
     host: str,
-    port: int,
+    port: int | None,
     path: str,
 ) -> dict[str, Any]:
     if not is_loopback_host(host):
@@ -238,9 +234,36 @@ def _start_locked(
         if _pid_is_alive(pid) and _process_owns_instance(
             pid, str(existing["instance_id"])
         ):
+            existing = _recover_starting_state(existing, paths)
+            if existing.get("lifecycle", "running") == "running":
+                _write_port_profile(paths["port"], int(existing["port"]))
             return _state_result(existing, already_running=True)
         _remove_state(paths["state"])
 
+    with _port_allocation_lock():
+        selected_port = _select_start_port(
+            project_root=project_root,
+            paths=paths,
+            host=host,
+            requested_port=port,
+        )
+        return _launch_daemon_locked(
+            project_root=project_root,
+            paths=paths,
+            host=host,
+            port=selected_port,
+            path=path,
+        )
+
+
+def _launch_daemon_locked(
+    *,
+    project_root: Path,
+    paths: Mapping[str, Path],
+    host: str,
+    port: int,
+    path: str,
+) -> dict[str, Any]:
     probe_host = _probe_host(host)
     if _can_connect(probe_host, port):
         raise DaemonError(f"cannot start daemon: {host}:{port} is already in use")
@@ -311,6 +334,7 @@ def _start_locked(
             raise DaemonError("started process failed daemon ownership verification")
         state["lifecycle"] = "running"
         state["ready_at"] = datetime.now(timezone.utc).isoformat()
+        _write_port_profile(paths["port"], port)
         _write_state(paths["state"], state)
     except BaseException:
         _terminate_failed_start(process)
@@ -383,6 +407,7 @@ def _project_paths(project_root: Path) -> dict[str, Path]:
         "lock": daemon_dir / f"{project_hash}.lock",
         "log": daemon_dir / f"{project_hash}.log",
         "token": daemon_dir / f"{project_hash}.token",
+        "port": daemon_dir / f"{project_hash}.port",
     }
 
 
@@ -398,6 +423,12 @@ def _ensure_daemon_dir() -> Path:
     DEFAULT_DAEMONS_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(DEFAULT_DAEMONS_DIR, 0o700)
     return DEFAULT_DAEMONS_DIR
+
+
+@contextmanager
+def _port_allocation_lock() -> Iterator[None]:
+    with _project_lock(_ensure_daemon_dir() / ".ports.lock"):
+        yield
 
 
 @contextmanager
@@ -466,6 +497,120 @@ def _read_token(path: Path) -> str:
     if not token or any(character.isspace() for character in token):
         raise DaemonError("daemon authentication token file is invalid")
     return token
+
+
+def _select_start_port(
+    *,
+    project_root: Path,
+    paths: Mapping[str, Path],
+    host: str,
+    requested_port: int | None,
+) -> int:
+    probe_host = _probe_host(host)
+    reserved_ports = _reserved_profile_ports(paths["port"])
+
+    if requested_port is not None:
+        if requested_port in reserved_ports:
+            raise DaemonError(
+                f"cannot use explicit port {requested_port}: it is reserved by "
+                "another Nomad project"
+            )
+        if _can_connect(probe_host, requested_port):
+            raise DaemonError(
+                f"cannot start daemon: {host}:{requested_port} is already in use"
+            )
+        return requested_port
+
+    persisted_port = _read_port_profile(paths["port"])
+    if persisted_port is not None:
+        if _can_connect(probe_host, persisted_port):
+            raise DaemonError(
+                f"persisted daemon port {persisted_port} is already in use; "
+                "choose a free port with --port"
+            )
+        return persisted_port
+
+    first_port = project_default_port(project_root)
+    port_count = PROJECT_PORT_MAX - PROJECT_PORT_MIN + 1
+    first_offset = first_port - PROJECT_PORT_MIN
+    for offset in range(port_count):
+        candidate = PROJECT_PORT_MIN + (first_offset + offset) % port_count
+        if candidate in reserved_ports:
+            continue
+        if not _can_connect(probe_host, candidate):
+            return candidate
+    raise DaemonError("cannot start daemon: no free project daemon port is available")
+
+
+def _reserved_profile_ports(current_profile: Path) -> set[int]:
+    reserved: set[int] = set()
+    for candidate in current_profile.parent.glob("*.port"):
+        if candidate == current_profile:
+            continue
+        try:
+            port = _read_port_profile(candidate)
+        except DaemonError:
+            continue
+        if port is not None:
+            reserved.add(port)
+    return reserved
+
+
+def _read_port_profile(path: Path) -> int | None:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise DaemonError("cannot read daemon port profile") from exc
+
+    try:
+        with os.fdopen(fd, "r", encoding="ascii") as handle:
+            metadata = os.fstat(handle.fileno())
+            if not stat.S_ISREG(metadata.st_mode):
+                raise DaemonError("daemon port profile is not a regular file")
+            os.fchmod(handle.fileno(), 0o600)
+            value = handle.read().strip()
+    except DaemonError:
+        raise
+    except (OSError, UnicodeError) as exc:
+        raise DaemonError("cannot read daemon port profile") from exc
+
+    try:
+        port = int(value)
+    except ValueError as exc:
+        raise DaemonError("daemon port profile is invalid") from exc
+    if not value.isascii() or not value.isdigit() or not 1 <= port <= 65535:
+        raise DaemonError("daemon port profile is invalid")
+    return port
+
+
+def _write_port_profile(path: Path, port: int) -> None:
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise DaemonError("cannot persist invalid daemon port")
+
+    fd, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        os.chmod(temporary_path, 0o600)
+        with os.fdopen(fd, "w", encoding="ascii") as handle:
+            handle.write(f"{port}\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+        os.chmod(path, 0o600)
+    finally:
+        try:
+            temporary_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _write_state(path: Path, state: Mapping[str, Any]) -> None:
@@ -562,6 +707,34 @@ def _remove_state(path: Path) -> None:
         path.unlink()
     except FileNotFoundError:
         pass
+
+
+def _recover_starting_state(
+    state: Mapping[str, Any],
+    paths: Mapping[str, Path],
+) -> dict[str, Any]:
+    recovered = dict(state)
+    if recovered.get("lifecycle", "running") != "starting":
+        return recovered
+
+    try:
+        bearer_token = _read_token(paths["token"])
+        health_data = _mcp_health_data(
+            str(recovered["url"]),
+            bearer_token,
+            timeout=STARTING_RECOVERY_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        return recovered
+
+    if health_data.get("pid") != int(recovered["pid"]):
+        return recovered
+
+    recovered["lifecycle"] = "running"
+    recovered["ready_at"] = datetime.now(timezone.utc).isoformat()
+    _write_port_profile(paths["port"], int(recovered["port"]))
+    _write_state(paths["state"], recovered)
+    return recovered
 
 
 def _process_owns_instance(pid: int, instance_id: str) -> bool:

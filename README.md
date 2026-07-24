@@ -32,6 +32,11 @@ HTTP daemon. Stdio remains available for compatible clients and one-off use.
 - `tmux` on remote machines when using long-running tasks
 - Key-based SSH access to your remote targets
 
+Persistent daemon lifecycle management currently supports macOS, Linux, and
+other POSIX systems. The Windows daemon is not supported. Stdio transport does
+not use the daemon lifecycle, but Windows support is not currently claimed or
+tested.
+
 ## Installation
 
 Run the latest PyPI release directly with `uvx`:
@@ -110,9 +115,11 @@ Then fully quit Codex Desktop and reopen it so the new process inherits the
 variable. The `launchctl` value belongs to the current login session and may
 need to be set again after logging out or restarting the Mac.
 
-Each local project receives a stable high port, its own token environment
-variable, and its own daemon state. Give every project a distinct MCP name, such
-as `nomad-api` and `nomad-dataset`, and register each project's reported URL.
+Each local project receives a persisted high port, its own token environment
+variable, and its own daemon state. On first start, Nomad scans deterministically
+from the project's hash-derived candidate and avoids listening or already
+reserved project ports. Give every project a distinct MCP name, such as
+`nomad-api` and `nomad-dataset`, and register each project's reported URL.
 
 Manage the daemon with:
 

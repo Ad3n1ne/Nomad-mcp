@@ -15,7 +15,9 @@ authors = [
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
-    "Operating System :: OS Independent",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX",
+    "Operating System :: POSIX :: Linux",
 ]
 dependencies = [
     "mcp>=1.27.0,<2",

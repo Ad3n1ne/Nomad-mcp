@@ -114,6 +114,8 @@ def test_start_writes_secure_project_state_and_log(
     assert stat.S_IMODE(paths["log"].stat().st_mode) == 0o600
     assert stat.S_IMODE(paths["lock"].stat().st_mode) == 0o600
     assert stat.S_IMODE(paths["token"].stat().st_mode) == 0o600
+    assert stat.S_IMODE(paths["port"].stat().st_mode) == 0o600
+    assert paths["port"].read_text(encoding="ascii") == f"{expected_port}\n"
 
     command, kwargs = popen_calls[0]
     assert command[:4] == [sys.executable, "-m", "nomad.cli", "serve"]
@@ -173,23 +175,126 @@ def test_starting_state_exists_while_readiness_is_running(
     assert result["lifecycle"] == "running"
 
 
-def test_status_and_idempotent_start_preserve_starting_lifecycle(
+def test_status_recovers_starting_daemon_after_launcher_crash(
     daemon_home, project, monkeypatch
 ):
     paths, payload = _state(project)
     payload["lifecycle"] = "starting"
     daemon._write_state(paths["state"], payload)
+    paths["token"].write_text("recovery-token\n", encoding="ascii")
     monkeypatch.setattr(daemon, "_pid_is_alive", lambda pid: True)
     monkeypatch.setattr(daemon, "_process_owns_instance", lambda *args: True)
+    health_calls = []
+
+    def healthy(url, token, *, timeout):
+        health_calls.append((url, token, timeout))
+        return {"pid": payload["pid"]}
+
+    monkeypatch.setattr(daemon, "_mcp_health_data", healthy)
+
+    status = daemon.status_daemon(project=project)
+
+    assert status["status"] == "running"
+    assert status["running"] is True
+    assert status["ready_at"]
+    assert health_calls == [
+        (
+            payload["url"],
+            "recovery-token",
+            daemon.STARTING_RECOVERY_TIMEOUT_SECONDS,
+        )
+    ]
+    persisted = json.loads(paths["state"].read_text(encoding="utf-8"))
+    assert persisted["lifecycle"] == "running"
+    assert persisted["ready_at"] == status["ready_at"]
+    assert paths["port"].read_text(encoding="ascii") == "8765\n"
+
+
+def test_idempotent_start_recovers_existing_starting_daemon(
+    daemon_home, project, monkeypatch
+):
+    paths, payload = _state(project)
+    payload["lifecycle"] = "starting"
+    daemon._write_state(paths["state"], payload)
+    paths["token"].write_text("recovery-token\n", encoding="ascii")
+    monkeypatch.setattr(daemon, "_pid_is_alive", lambda pid: True)
+    monkeypatch.setattr(daemon, "_process_owns_instance", lambda *args: True)
+    monkeypatch.setattr(
+        daemon,
+        "_mcp_health_data",
+        lambda url, token, *, timeout: {"pid": payload["pid"]},
+    )
+    monkeypatch.setattr(
+        daemon.subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail("recovered daemon must not relaunch"),
+    )
+
+    started = daemon.start_daemon(project=project, port=9999)
+
+    assert started["status"] == "running"
+    assert started["already_running"] is True
+    assert started["port"] == payload["port"]
+    assert paths["port"].read_text(encoding="ascii") == "8765\n"
+
+
+def test_starting_recovery_auth_failure_keeps_manageable_state_without_token_leak(
+    daemon_home, project, monkeypatch
+):
+    paths, payload = _state(project)
+    payload["lifecycle"] = "starting"
+    daemon._write_state(paths["state"], payload)
+    token = "must-not-leak"
+    paths["token"].write_text(f"{token}\n", encoding="ascii")
+    monkeypatch.setattr(daemon, "_pid_is_alive", lambda pid: True)
+    monkeypatch.setattr(daemon, "_process_owns_instance", lambda *args: True)
+    monkeypatch.setattr(
+        daemon,
+        "_mcp_health_data",
+        lambda url, bearer_token, *, timeout: (_ for _ in ()).throw(
+            RuntimeError(f"authentication failed for {bearer_token}")
+        ),
+    )
 
     status = daemon.status_daemon(project=project)
     started = daemon.start_daemon(project=project)
 
     assert status["status"] == "starting"
-    assert status["running"] is False
     assert started["status"] == "starting"
-    assert started["running"] is False
-    assert started["already_running"] is True
+    assert token not in json.dumps(status)
+    assert token not in json.dumps(started)
+    assert json.loads(paths["state"].read_text())["lifecycle"] == "starting"
+
+    alive = iter([True, False])
+    monkeypatch.setattr(daemon, "_pid_is_alive", lambda pid: next(alive))
+    monkeypatch.setattr(daemon.os, "kill", lambda pid, sig: None)
+    stopped = daemon.stop_daemon(project=project)
+
+    assert stopped["status"] == "stopped"
+    assert not paths["state"].exists()
+
+
+def test_starting_recovery_health_pid_mismatch_keeps_starting(
+    daemon_home, project, monkeypatch
+):
+    paths, payload = _state(project)
+    payload["lifecycle"] = "starting"
+    daemon._write_state(paths["state"], payload)
+    paths["token"].write_text("recovery-token\n", encoding="ascii")
+    monkeypatch.setattr(daemon, "_pid_is_alive", lambda pid: True)
+    monkeypatch.setattr(daemon, "_process_owns_instance", lambda *args: True)
+    monkeypatch.setattr(
+        daemon,
+        "_mcp_health_data",
+        lambda url, token, *, timeout: {"pid": payload["pid"] + 1},
+    )
+
+    status = daemon.status_daemon(project=project)
+
+    assert status["status"] == "starting"
+    assert status["running"] is False
+    assert "ready_at" not in status
+    assert not paths["port"].exists()
 
 
 def test_old_state_without_lifecycle_is_reported_running(
@@ -237,6 +342,7 @@ def test_failed_start_returns_error_and_leaves_no_state(
     assert process.waited is True
     assert not paths["state"].exists()
     assert paths["token"].exists()
+    assert not paths["port"].exists()
 
 
 def test_keyboard_interrupt_terminates_child_and_removes_starting_state(
@@ -418,6 +524,7 @@ def test_projects_have_isolated_state_and_log_paths(
     assert first_paths["state"] != second_paths["state"]
     assert first_paths["log"] != second_paths["log"]
     assert first_paths["token"] != second_paths["token"]
+    assert first_paths["port"] != second_paths["port"]
     assert first_paths["state"].parent == second_paths["state"].parent == daemon_home
 
 
@@ -471,13 +578,127 @@ def test_restart_legacy_remote_state_falls_back_to_loopback(
     assert "allow_remote" not in starts[0]
 
 
-def test_start_rejects_an_address_already_in_use(
+def test_auto_port_scans_past_listening_hash_candidate(
+    daemon_home, project, monkeypatch
+):
+    process, _ = _mock_successful_start(monkeypatch)
+    candidate = daemon.project_default_port(project)
+    monkeypatch.setattr(
+        daemon,
+        "_can_connect",
+        lambda host, port: port == candidate,
+    )
+
+    result = daemon.start_daemon(project=project)
+
+    expected = (
+        daemon.PROJECT_PORT_MIN
+        if candidate == daemon.PROJECT_PORT_MAX
+        else candidate + 1
+    )
+    assert result["pid"] == process.pid
+    assert result["port"] == expected
+
+
+def test_start_rejects_an_explicit_address_already_in_use(
     daemon_home, project, monkeypatch
 ):
     monkeypatch.setattr(daemon, "_can_connect", lambda host, port: True)
 
     with pytest.raises(daemon.DaemonError, match="already in use"):
+        daemon.start_daemon(project=project, port=8765)
+
+
+def test_persisted_port_is_reused_after_stop_start(
+    daemon_home, project, monkeypatch
+):
+    _, popen_calls = _mock_successful_start(monkeypatch)
+    first = daemon.start_daemon(project=project, port=54321)
+    paths = daemon._project_paths(project.resolve())
+    monkeypatch.setattr(daemon.os, "kill", lambda pid, sig: None)
+    alive = iter([True, False])
+    monkeypatch.setattr(daemon, "_pid_is_alive", lambda pid: next(alive))
+
+    daemon.stop_daemon(project=project)
+    second = daemon.start_daemon(project=project)
+
+    assert first["port"] == second["port"] == 54321
+    assert paths["port"].read_text(encoding="ascii") == "54321\n"
+    assert popen_calls[1][0][6:8] == ["--port", "54321"]
+
+
+def test_occupied_persisted_port_requires_explicit_override(
+    daemon_home, project, monkeypatch
+):
+    paths = daemon._project_paths(project.resolve())
+    daemon._write_port_profile(paths["port"], 54321)
+    monkeypatch.setattr(
+        daemon,
+        "_can_connect",
+        lambda host, port: port == 54321,
+    )
+
+    with pytest.raises(
+        daemon.DaemonError,
+        match=r"persisted daemon port 54321 is already in use.*--port",
+    ):
         daemon.start_daemon(project=project)
+
+    _mock_successful_start(monkeypatch)
+    result = daemon.start_daemon(project=project, port=54322)
+
+    assert result["port"] == 54322
+    assert paths["port"].read_text(encoding="ascii") == "54322\n"
+
+
+def test_hash_collision_projects_receive_distinct_persisted_ports(
+    daemon_home, tmp_path, monkeypatch
+):
+    first = tmp_path / "first-collision"
+    second = tmp_path / "second-collision"
+    first.mkdir()
+    second.mkdir()
+    collision_port = 55000
+    monkeypatch.setattr(daemon, "project_default_port", lambda project: collision_port)
+    _mock_successful_start(monkeypatch)
+
+    first_result = daemon.start_daemon(project=first)
+    second_result = daemon.start_daemon(project=second)
+
+    assert first_result["port"] == collision_port
+    assert second_result["port"] == collision_port + 1
+    first_paths = daemon._project_paths(first.resolve())
+    second_paths = daemon._project_paths(second.resolve())
+    assert first_paths["port"].read_text(encoding="ascii") == "55000\n"
+    assert second_paths["port"].read_text(encoding="ascii") == "55001\n"
+
+
+@pytest.mark.parametrize("value", ["", "not-a-port", "0", "65536", "-1"])
+def test_invalid_port_profile_is_rejected_without_exposing_path(
+    daemon_home, project, value
+):
+    paths = daemon._project_paths(project.resolve())
+    paths["port"].write_text(f"{value}\n", encoding="ascii")
+
+    with pytest.raises(daemon.DaemonError, match="port profile is invalid") as exc_info:
+        daemon.start_daemon(project=project)
+
+    assert str(paths["port"]) not in str(exc_info.value)
+
+
+def test_port_profile_symlink_is_rejected_without_following_target(
+    daemon_home, project, tmp_path
+):
+    paths = daemon._project_paths(project.resolve())
+    target = tmp_path / "outside-port"
+    target.write_text("54321\n", encoding="ascii")
+    paths["port"].symlink_to(target)
+
+    with pytest.raises(daemon.DaemonError, match="cannot read daemon port profile") as exc_info:
+        daemon.start_daemon(project=project)
+
+    assert str(paths["port"]) not in str(exc_info.value)
+    assert target.read_text(encoding="ascii") == "54321\n"
 
 
 def test_process_ownership_requires_matching_hidden_id(monkeypatch):
