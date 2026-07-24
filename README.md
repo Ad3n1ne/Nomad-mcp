@@ -42,13 +42,13 @@ tested.
 Run the latest PyPI release directly with `uvx`:
 
 ```bash
-uvx nomad-mcp
+uvx --from nomad-mcp nomad
 ```
 
 Run a specific GitHub tag without waiting for PyPI propagation:
 
 ```bash
-uvx --from git+https://github.com/Ad3n1ne/Nomad-mcp.git@v0.2.0 nomad
+uvx --from git+https://github.com/Ad3n1ne/Nomad-mcp.git@v0.2.1 nomad
 ```
 
 Or install a release as an isolated global command with `pipx`:
@@ -149,7 +149,7 @@ Recommended PyPI no-install configuration:
   "mcpServers": {
     "nomad": {
       "command": "uvx",
-      "args": ["nomad-mcp"]
+      "args": ["--from", "nomad-mcp", "nomad"]
     }
   }
 }
@@ -164,7 +164,7 @@ For the latest GitHub tag:
       "command": "uvx",
       "args": [
         "--from",
-        "git+https://github.com/Ad3n1ne/Nomad-mcp.git@v0.2.0",
+        "git+https://github.com/Ad3n1ne/Nomad-mcp.git@v0.2.1",
         "nomad"
       ]
     }
@@ -177,7 +177,7 @@ For TOML-based clients:
 ```toml
 [mcp_servers.nomad]
 command = "uvx"
-args = ["nomad-mcp"]
+args = ["--from", "nomad-mcp", "nomad"]
 startup_timeout_sec = 120
 ```
 

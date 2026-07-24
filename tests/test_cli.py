@@ -29,7 +29,10 @@ def test_cli_client_config_uvx_json(capsys):
 
     payload = json.loads(capsys.readouterr().out)
     config = payload["mcpServers"]["nomad"]
-    assert config == {"command": "uvx", "args": ["nomad-mcp"]}
+    assert config == {
+        "command": "uvx",
+        "args": ["--from", "nomad-mcp", "nomad"],
+    }
 
 
 def test_cli_client_config_github_json(capsys):
@@ -61,7 +64,7 @@ def test_cli_client_config_stdio_custom_name_keeps_compatible_output(capsys):
         "mcpServers": {
             "nomad_project-1": {
                 "command": "uvx",
-                "args": ["nomad-mcp"],
+                "args": ["--from", "nomad-mcp", "nomad"],
             }
         }
     }

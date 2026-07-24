@@ -422,7 +422,7 @@ def _client_config(
 
     if runner == "uvx":
         command = "uvx"
-        args = [PACKAGE_NAME]
+        args = ["--from", PACKAGE_NAME, "nomad"]
     elif runner == "github":
         command = "uvx"
         args = ["--from", f"{GITHUB_PACKAGE_URL}@v{__version__}", "nomad"]
