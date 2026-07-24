@@ -48,7 +48,7 @@ uvx nomad-mcp
 Run a specific GitHub tag without waiting for PyPI propagation:
 
 ```bash
-uvx --from git+https://github.com/Ad3n1ne/Nomad-mcp.git@v0.1.1 nomad
+uvx --from git+https://github.com/Ad3n1ne/Nomad-mcp.git@v0.2.0 nomad
 ```
 
 Or install a release as an isolated global command with `pipx`:
@@ -164,7 +164,7 @@ For the latest GitHub tag:
       "command": "uvx",
       "args": [
         "--from",
-        "git+https://github.com/Ad3n1ne/Nomad-mcp.git@v0.1.1",
+        "git+https://github.com/Ad3n1ne/Nomad-mcp.git@v0.2.0",
         "nomad"
       ]
     }
