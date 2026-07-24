@@ -22,6 +22,11 @@ from ipaddress import ip_address
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
+import anyio
+import httpx
+from mcp import ClientSession
+from mcp.client.streamable_http import streamable_http_client
+
 from nomad import __version__
 
 
@@ -108,7 +113,7 @@ def status_daemon(
                 "message": "Recorded PID is alive but is not the recorded Nomad daemon instance.",
             }
 
-        return _running_result(state, already_running=True)
+        return _state_result(state, already_running=True)
 
 
 def stop_daemon(
@@ -214,7 +219,7 @@ def _start_locked(
         if _pid_is_alive(pid) and _process_owns_instance(
             pid, str(existing["instance_id"])
         ):
-            return _running_result(existing, already_running=True)
+            return _state_result(existing, already_running=True)
         _remove_state(paths["state"])
 
     probe_host = _probe_host(host)
@@ -260,32 +265,42 @@ def _start_locked(
         log_handle.close()
 
     try:
-        _wait_until_ready(process, probe_host, port)
+        state = {
+            "schema_version": SCHEMA_VERSION,
+            "pid": process.pid,
+            "project_root": str(project_root),
+            "host": host,
+            "port": port,
+            "path": path,
+            "url": _build_url(host, port, path),
+            "version": __version__,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "instance_id": instance_id,
+            "log_path": str(paths["log"]),
+            "allow_remote": allow_remote,
+            "auth": True,
+            "token_env_var": _project_token_env_var(project_root),
+            "lifecycle": "starting",
+        }
+        _write_state(paths["state"], state)
+        _wait_until_ready(
+            process,
+            probe_host,
+            port,
+            path,
+            bearer_token,
+        )
         if not _process_owns_instance(process.pid, instance_id):
             raise DaemonError("started process failed daemon ownership verification")
-    except DaemonError:
+        state["lifecycle"] = "running"
+        state["ready_at"] = datetime.now(timezone.utc).isoformat()
+        _write_state(paths["state"], state)
+    except BaseException:
         _terminate_failed_start(process)
         _remove_state(paths["state"])
         raise
 
-    state = {
-        "schema_version": SCHEMA_VERSION,
-        "pid": process.pid,
-        "project_root": str(project_root),
-        "host": host,
-        "port": port,
-        "path": path,
-        "url": _build_url(host, port, path),
-        "version": __version__,
-        "started_at": datetime.now(timezone.utc).isoformat(),
-        "instance_id": instance_id,
-        "log_path": str(paths["log"]),
-        "allow_remote": allow_remote,
-        "auth": True,
-        "token_env_var": _project_token_env_var(project_root),
-    }
-    _write_state(paths["state"], state)
-    return _running_result(state, already_running=False)
+    return _state_result(state, already_running=False)
 
 
 def _stop_locked(
@@ -514,11 +529,14 @@ def _valid_state(payload: Any, project_root: Path) -> bool:
         "allow_remote": bool,
         "auth": bool,
         "token_env_var": str,
+        "ready_at": str,
     }.items():
         if optional_key in payload and not isinstance(
             payload[optional_key], expected_type
         ):
             return False
+    if payload.get("lifecycle", "running") not in {"starting", "running"}:
+        return False
     return True
 
 
@@ -597,10 +615,12 @@ def _wait_until_ready(
     process: subprocess.Popen[bytes],
     host: str,
     port: int,
+    path: str,
+    bearer_token: str,
     timeout: float = START_TIMEOUT_SECONDS,
 ) -> None:
     deadline = time.monotonic() + timeout
-    consecutive_connections = 0
+    last_health_error: str | None = None
     while time.monotonic() < deadline:
         returncode = process.poll()
         if returncode is not None:
@@ -608,16 +628,81 @@ def _wait_until_ready(
                 f"Nomad daemon exited during startup with status {returncode}"
             )
         if _can_connect(host, port):
-            consecutive_connections += 1
-            if consecutive_connections >= 2:
-                return
-        else:
-            consecutive_connections = 0
+            remaining = max(0.1, deadline - time.monotonic())
+            try:
+                health_data = _mcp_health_data(
+                    _build_url(host, port, path),
+                    bearer_token,
+                    timeout=min(1.0, remaining),
+                )
+            except Exception as exc:
+                last_health_error = type(exc).__name__
+            else:
+                health_pid = health_data.get("pid")
+                if health_pid == process.pid:
+                    return
+                last_health_error = "health_pid_mismatch"
         time.sleep(POLL_INTERVAL_SECONDS)
-    raise DaemonError(
-        f"Nomad daemon did not become reachable at {host}:{port} "
-        f"within {timeout:g} seconds"
+    detail = (
+        f"; last health error: {last_health_error}"
+        if last_health_error is not None
+        else ""
     )
+    raise DaemonError(
+        f"Nomad daemon did not pass authenticated MCP health at {host}:{port} "
+        f"within {timeout:g} seconds{detail}"
+    )
+
+
+def _mcp_health_data(
+    url: str,
+    bearer_token: str,
+    *,
+    timeout: float,
+) -> dict[str, Any]:
+    async def call_health() -> dict[str, Any]:
+        with anyio.fail_after(timeout):
+            async with httpx.AsyncClient(
+                headers={"Authorization": f"Bearer {bearer_token}"},
+                timeout=httpx.Timeout(timeout),
+            ) as http_client:
+                async with streamable_http_client(
+                    url,
+                    http_client=http_client,
+                ) as streams:
+                    async with ClientSession(streams[0], streams[1]) as session:
+                        await session.initialize()
+                        result = await session.call_tool("health")
+
+        text_content = next(
+            (
+                content.text
+                for content in result.content
+                if hasattr(content, "text")
+            ),
+            None,
+        )
+        if text_content is None:
+            raise DaemonError("MCP health returned no text content")
+        try:
+            payload = json.loads(text_content)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise DaemonError("MCP health returned invalid JSON") from exc
+        if (
+            not isinstance(payload, dict)
+            or payload.get("ok") is not True
+            or payload.get("tool") != "health"
+        ):
+            raise DaemonError("MCP health did not report success")
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            raise DaemonError("MCP health returned invalid data")
+        pid = data.get("pid")
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            raise DaemonError("MCP health returned an invalid pid")
+        return data
+
+    return anyio.run(call_health)
 
 
 def _terminate_failed_start(process: subprocess.Popen[bytes]) -> None:
@@ -680,22 +765,29 @@ _PUBLIC_STATE_FIELDS = (
     "url",
     "version",
     "started_at",
+    "ready_at",
     "instance_id",
     "log_path",
     "allow_remote",
     "auth",
     "token_env_var",
+    "lifecycle",
 )
 
 
-def _running_result(
+def _state_result(
     state: Mapping[str, Any], *, already_running: bool
 ) -> dict[str, Any]:
+    lifecycle = str(state.get("lifecycle", "running"))
+    public_state = {
+        key: state[key] for key in _PUBLIC_STATE_FIELDS if key in state
+    }
+    public_state["lifecycle"] = lifecycle
     return {
-        "status": "running",
-        "running": True,
+        "status": lifecycle,
+        "running": lifecycle == "running",
         "already_running": already_running,
-        **{key: state[key] for key in _PUBLIC_STATE_FIELDS if key in state},
+        **public_state,
     }
 
 

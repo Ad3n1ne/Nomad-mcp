@@ -101,11 +101,13 @@ def test_start_writes_secure_project_state_and_log(
         "url": f"http://127.0.0.1:{expected_port}/mcp",
         "version": __version__,
         "started_at": state_payload["started_at"],
+        "ready_at": state_payload["ready_at"],
         "instance_id": state_payload["instance_id"],
         "log_path": str(paths["log"]),
         "allow_remote": False,
         "auth": True,
         "token_env_var": daemon._project_token_env_var(project.resolve()),
+        "lifecycle": "running",
     }
     assert stat.S_IMODE(daemon_home.stat().st_mode) == 0o700
     assert stat.S_IMODE(paths["state"].stat().st_mode) == 0o600
@@ -142,6 +144,68 @@ def test_repeated_start_is_idempotent(daemon_home, project, monkeypatch):
     assert len(popen_calls) == 1
 
 
+def test_starting_state_exists_while_readiness_is_running(
+    daemon_home, project, monkeypatch
+):
+    process = FakeProcess()
+    observed = {}
+    monkeypatch.setattr(
+        daemon.subprocess,
+        "Popen",
+        lambda *args, **kwargs: process,
+    )
+    monkeypatch.setattr(daemon, "_can_connect", lambda host, port: False)
+    monkeypatch.setattr(daemon, "_process_owns_instance", lambda *args: True)
+
+    def observe_state(*args):
+        paths = daemon._project_paths(project.resolve())
+        observed.update(json.loads(paths["state"].read_text(encoding="utf-8")))
+
+    monkeypatch.setattr(daemon, "_wait_until_ready", observe_state)
+
+    result = daemon.start_daemon(project=project)
+
+    assert observed["lifecycle"] == "starting"
+    assert observed["pid"] == process.pid
+    assert observed["instance_id"] == result["instance_id"]
+    assert "token" not in observed
+    assert result["status"] == "running"
+    assert result["lifecycle"] == "running"
+
+
+def test_status_and_idempotent_start_preserve_starting_lifecycle(
+    daemon_home, project, monkeypatch
+):
+    paths, payload = _state(project)
+    payload["lifecycle"] = "starting"
+    daemon._write_state(paths["state"], payload)
+    monkeypatch.setattr(daemon, "_pid_is_alive", lambda pid: True)
+    monkeypatch.setattr(daemon, "_process_owns_instance", lambda *args: True)
+
+    status = daemon.status_daemon(project=project)
+    started = daemon.start_daemon(project=project)
+
+    assert status["status"] == "starting"
+    assert status["running"] is False
+    assert started["status"] == "starting"
+    assert started["running"] is False
+    assert started["already_running"] is True
+
+
+def test_old_state_without_lifecycle_is_reported_running(
+    daemon_home, project, monkeypatch
+):
+    _state(project)
+    monkeypatch.setattr(daemon, "_pid_is_alive", lambda pid: True)
+    monkeypatch.setattr(daemon, "_process_owns_instance", lambda *args: True)
+
+    result = daemon.status_daemon(project=project)
+
+    assert result["status"] == "running"
+    assert result["running"] is True
+    assert result["lifecycle"] == "running"
+
+
 def test_status_removes_dead_stale_state(daemon_home, project, monkeypatch):
     paths, _ = _state(project)
     monkeypatch.setattr(daemon, "_pid_is_alive", lambda pid: False)
@@ -171,6 +235,58 @@ def test_failed_start_returns_error_and_leaves_no_state(
     paths = daemon._project_paths(project.resolve())
     assert process.terminated is True
     assert process.waited is True
+    assert not paths["state"].exists()
+    assert paths["token"].exists()
+
+
+def test_keyboard_interrupt_terminates_child_and_removes_starting_state(
+    daemon_home, project, monkeypatch
+):
+    process = FakeProcess()
+    monkeypatch.setattr(
+        daemon.subprocess,
+        "Popen",
+        lambda *args, **kwargs: process,
+    )
+    monkeypatch.setattr(daemon, "_can_connect", lambda host, port: False)
+    monkeypatch.setattr(
+        daemon,
+        "_wait_until_ready",
+        lambda *args: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        daemon.start_daemon(project=project)
+
+    paths = daemon._project_paths(project.resolve())
+    assert process.terminated is True
+    assert process.waited is True
+    assert not paths["state"].exists()
+    assert paths["token"].exists()
+
+
+@pytest.mark.parametrize("fail_on_write", [1, 2])
+def test_state_write_failure_terminates_child_and_removes_state(
+    daemon_home, project, monkeypatch, fail_on_write
+):
+    process, _ = _mock_successful_start(monkeypatch)
+    original_write_state = daemon._write_state
+    write_count = 0
+
+    def failing_write(path, state):
+        nonlocal write_count
+        write_count += 1
+        if write_count == fail_on_write:
+            raise OSError("state write failed")
+        original_write_state(path, state)
+
+    monkeypatch.setattr(daemon, "_write_state", failing_write)
+
+    with pytest.raises(OSError, match="state write failed"):
+        daemon.start_daemon(project=project)
+
+    paths = daemon._project_paths(project.resolve())
+    assert process.terminated is True
     assert not paths["state"].exists()
     assert paths["token"].exists()
 
@@ -367,6 +483,71 @@ def test_pid_alive_treats_zombie_as_stopped(monkeypatch):
     monkeypatch.setattr(daemon, "_process_state", lambda pid: "Z+")
 
     assert daemon._pid_is_alive(10) is False
+
+
+def test_wait_until_ready_requires_authenticated_health_with_matching_pid(
+    monkeypatch
+):
+    process = FakeProcess(pid=4242)
+    calls = []
+    monkeypatch.setattr(daemon, "_can_connect", lambda host, port: True)
+
+    def health_data(url, token, *, timeout):
+        calls.append((url, token, timeout))
+        return {"pid": process.pid, "cwd": "/tmp/project"}
+
+    monkeypatch.setattr(daemon, "_mcp_health_data", health_data)
+
+    daemon._wait_until_ready(
+        process,
+        "127.0.0.1",
+        54321,
+        "/mcp",
+        "private-token",
+        timeout=0.5,
+    )
+
+    assert calls
+    assert calls[0][0] == "http://127.0.0.1:54321/mcp"
+    assert calls[0][1] == "private-token"
+
+
+@pytest.mark.parametrize(
+    ("health_behavior", "expected_error"),
+    [
+        (lambda token: {"pid": 9999}, "health_pid_mismatch"),
+        (
+            lambda token: (_ for _ in ()).throw(
+                RuntimeError(f"foreign service rejected {token}")
+            ),
+            "RuntimeError",
+        ),
+    ],
+)
+def test_wait_until_ready_rejects_wrong_service_without_leaking_token(
+    monkeypatch, health_behavior, expected_error
+):
+    process = FakeProcess(pid=4242)
+    token = "must-never-appear"
+    monkeypatch.setattr(daemon, "_can_connect", lambda host, port: True)
+    monkeypatch.setattr(
+        daemon,
+        "_mcp_health_data",
+        lambda url, bearer_token, *, timeout: health_behavior(bearer_token),
+    )
+
+    with pytest.raises(daemon.DaemonError) as exc_info:
+        daemon._wait_until_ready(
+            process,
+            "127.0.0.1",
+            54321,
+            "/mcp",
+            token,
+            timeout=0.01,
+        )
+
+    assert expected_error in str(exc_info.value)
+    assert token not in str(exc_info.value)
 
 
 def test_status_uses_public_allowlist_and_never_leaks_token_fields(
