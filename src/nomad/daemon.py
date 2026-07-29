@@ -174,13 +174,22 @@ def health_daemon(
         raise DaemonError(
             "daemon MCP health pid does not match recorded daemon pid"
         ) from None
+    health_version = health_data.get("version")
+    if (
+        not isinstance(health_version, str)
+        or not health_version.strip()
+        or health_version != state_version
+    ):
+        raise DaemonError(
+            "daemon MCP health version does not match recorded daemon version"
+        ) from None
 
     result = {
         "ok": True,
         "status": "healthy",
         "project_root": str(project_root),
         "pid": state_pid,
-        "version": state_version,
+        "version": health_version,
         "url": state_url,
     }
     return result
@@ -190,12 +199,18 @@ def stop_daemon(
     *,
     project: str | os.PathLike[str] | None = None,
     timeout: float = STOP_TIMEOUT_SECONDS,
+    expected_instance_id: str | None = None,
 ) -> dict[str, Any]:
     """Stops the project daemon after validating process ownership."""
     project_root = resolve_project(project)
     paths = _project_paths(project_root)
     with _project_lock(paths["lock"]):
-        return _stop_locked(project_root=project_root, paths=paths, timeout=timeout)
+        return _stop_locked(
+            project_root=project_root,
+            paths=paths,
+            timeout=timeout,
+            expected_instance_id=expected_instance_id,
+        )
 
 
 def restart_daemon(
@@ -472,6 +487,7 @@ def _stop_locked(
     project_root: Path,
     paths: Mapping[str, Path],
     timeout: float,
+    expected_instance_id: str | None = None,
 ) -> dict[str, Any]:
     state = _read_state(paths["state"], project_root)
     if state is None:
@@ -486,6 +502,12 @@ def _stop_locked(
                 stale_state_removed=True,
             )
 
+    instance_id = str(state["instance_id"])
+    if expected_instance_id is not None and instance_id != expected_instance_id:
+        raise DaemonOwnershipError(
+            "refusing to stop daemon: recorded instance changed"
+        )
+
     pid = int(state["pid"])
     if not _pid_is_alive(pid):
         _remove_state(paths["state"])
@@ -495,7 +517,6 @@ def _stop_locked(
             stale_state_removed=True,
         )
 
-    instance_id = str(state["instance_id"])
     if not _process_owns_instance(pid, instance_id):
         if not _pid_is_alive(pid):
             _remove_state(paths["state"])
@@ -558,8 +579,33 @@ def _project_token_env_var(project_root: Path) -> str:
 
 
 def _ensure_daemon_dir() -> Path:
-    DEFAULT_DAEMONS_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(DEFAULT_DAEMONS_DIR, 0o700)
+    try:
+        DEFAULT_DAEMONS_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    except OSError as exc:
+        raise DaemonError("cannot create daemon directory") from exc
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(DEFAULT_DAEMONS_DIR, flags)
+    except OSError as exc:
+        raise DaemonError("daemon directory is not a safe real directory") from exc
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
+            raise DaemonError(
+                "daemon directory must be owned by the current user"
+            )
+        os.fchmod(fd, 0o700)
+    except DaemonError:
+        raise
+    except OSError as exc:
+        raise DaemonError("cannot secure daemon directory") from exc
+    finally:
+        os.close(fd)
     return DEFAULT_DAEMONS_DIR
 
 
@@ -571,8 +617,13 @@ def _port_allocation_lock() -> Iterator[None]:
 
 @contextmanager
 def _project_lock(lock_path: Path) -> Iterator[None]:
-    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-    os.chmod(lock_path, 0o600)
+    fd = _open_regular_file(
+        lock_path,
+        os.O_RDWR | os.O_CREAT,
+        description="lock",
+        secure_mode=0o600,
+    )
+    assert fd is not None
     with os.fdopen(fd, "a+") as lock_handle:
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
         try:
@@ -582,9 +633,54 @@ def _project_lock(lock_path: Path) -> Iterator[None]:
 
 
 def _open_secure_append(path: Path):
-    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-    os.chmod(path, 0o600)
+    fd = _open_regular_file(
+        path,
+        os.O_WRONLY | os.O_APPEND | os.O_CREAT,
+        description="log",
+        secure_mode=0o600,
+    )
+    assert fd is not None
     return os.fdopen(fd, "ab", buffering=0)
+
+
+def _open_regular_file(
+    path: Path,
+    flags: int,
+    *,
+    description: str,
+    secure_mode: int | None = None,
+    missing_ok: bool = False,
+) -> int | None:
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+    try:
+        fd = os.open(path, flags, 0o600)
+    except FileNotFoundError:
+        if missing_ok:
+            return None
+        raise DaemonError(f"cannot open daemon {description}") from None
+    except OSError as exc:
+        raise DaemonError(f"cannot open daemon {description}") from exc
+
+    try:
+        metadata = os.fstat(fd)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+        ):
+            raise DaemonError(
+                f"daemon {description} must be a single-link regular file "
+                "owned by the current user"
+            )
+        if secure_mode is not None:
+            os.fchmod(fd, secure_mode)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
 
 
 def _read_or_create_token(path: Path) -> str:
@@ -730,6 +826,7 @@ def _write_port_profile(path: Path, port: int) -> None:
     if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
         raise DaemonError("cannot persist invalid daemon port")
 
+    _validate_replace_destination(path, description="port profile")
     fd, temporary_name = tempfile.mkstemp(
         dir=path.parent,
         prefix=f".{path.name}.",
@@ -737,13 +834,13 @@ def _write_port_profile(path: Path, port: int) -> None:
     )
     temporary_path = Path(temporary_name)
     try:
-        os.chmod(temporary_path, 0o600)
         with os.fdopen(fd, "w", encoding="ascii") as handle:
+            os.fchmod(handle.fileno(), 0o600)
             handle.write(f"{port}\n")
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary_path, path)
-        os.chmod(path, 0o600)
+        _fsync_replaced_parent(path, description="port profile")
     finally:
         try:
             temporary_path.unlink()
@@ -752,6 +849,7 @@ def _write_port_profile(path: Path, port: int) -> None:
 
 
 def _write_state(path: Path, state: Mapping[str, Any]) -> None:
+    _validate_replace_destination(path, description="lifecycle state")
     fd, temporary_name = tempfile.mkstemp(
         dir=path.parent,
         prefix=f".{path.name}.",
@@ -759,14 +857,14 @@ def _write_state(path: Path, state: Mapping[str, Any]) -> None:
     )
     temporary_path = Path(temporary_name)
     try:
-        os.chmod(temporary_path, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            os.fchmod(handle.fileno(), 0o600)
             json.dump(state, handle, indent=2, sort_keys=True)
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary_path, path)
-        os.chmod(path, 0o600)
+        _fsync_replaced_parent(path, description="lifecycle state")
     finally:
         try:
             temporary_path.unlink()
@@ -774,12 +872,61 @@ def _write_state(path: Path, state: Mapping[str, Any]) -> None:
             pass
 
 
-def _read_state(path: Path, project_root: Path) -> dict[str, Any] | None:
+def _validate_replace_destination(path: Path, *, description: str) -> None:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        metadata = os.lstat(path)
     except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise DaemonError(f"cannot inspect daemon {description}") from exc
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or metadata.st_nlink != 1
+    ):
+        raise DaemonError(
+            f"refusing to replace unsafe daemon {description} path"
+        )
+
+
+def _fsync_replaced_parent(path: Path, *, description: str) -> None:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        directory_fd = os.open(path.parent, flags)
+    except OSError:
+        raise DaemonError(
+            f"daemon {description} was replaced but durability is uncertain"
+        ) from None
+    try:
+        metadata = os.fstat(directory_fd)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise OSError("parent is not a directory")
+        os.fsync(directory_fd)
+    except OSError:
+        raise DaemonError(
+            f"daemon {description} was replaced but durability is uncertain"
+        ) from None
+    finally:
+        os.close(directory_fd)
+
+
+def _read_state(path: Path, project_root: Path) -> dict[str, Any] | None:
+    fd = _open_regular_file(
+        path,
+        os.O_RDONLY,
+        description="lifecycle state",
+        missing_ok=True,
+    )
+    if fd is None:
         return None
-    except (OSError, json.JSONDecodeError):
+    try:
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, UnicodeError, json.JSONDecodeError):
         _remove_state(path)
         return None
 
@@ -790,19 +937,18 @@ def _read_state(path: Path, project_root: Path) -> dict[str, Any] | None:
 
 
 def _read_claimable_state(path: Path, project_root: Path) -> dict[str, Any]:
-    flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
     try:
-        fd = os.open(path, flags)
-    except OSError as exc:
+        fd = _open_regular_file(
+            path,
+            os.O_RDONLY,
+            description="lifecycle state",
+        )
+    except DaemonError as exc:
         raise DaemonError("cannot read daemon lifecycle state") from exc
+    assert fd is not None
 
     try:
         with os.fdopen(fd, "r", encoding="utf-8") as handle:
-            metadata = os.fstat(handle.fileno())
-            if not stat.S_ISREG(metadata.st_mode):
-                raise DaemonError("daemon lifecycle state is not a regular file")
             payload = json.load(handle)
     except DaemonError:
         raise

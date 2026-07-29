@@ -63,7 +63,7 @@ def main(argv: list[str] | None = None) -> int | None:
 
         from nomad.server import main as server_main
 
-        bearer_token = os.environ.get("NOMAD_MCP_BEARER_TOKEN") or None
+        bearer_token = os.environ.pop("NOMAD_MCP_BEARER_TOKEN", None) or None
 
         server_main(
             transport="streamable-http",

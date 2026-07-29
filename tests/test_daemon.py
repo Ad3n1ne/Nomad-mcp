@@ -576,6 +576,32 @@ def test_health_daemon_rejects_health_pid_mismatch_without_token_leak(
     assert token not in str(exc_info.value)
 
 
+@pytest.mark.parametrize("health_version", [None, "", 123, "other-version"])
+def test_health_daemon_rejects_invalid_or_mismatched_version_without_token_leak(
+    daemon_home, project, monkeypatch, health_version
+):
+    paths, payload = _state(project)
+    token = "project-health-token"
+    paths["token"].write_text(f"{token}\n", encoding="ascii")
+    monkeypatch.setattr(daemon, "_pid_is_alive", lambda pid: True)
+    monkeypatch.setattr(daemon, "_process_owns_instance", lambda *args: True)
+    monkeypatch.setattr(
+        daemon,
+        "_mcp_health_data",
+        lambda *args, **kwargs: {
+            "pid": payload["pid"],
+            "version": health_version,
+        },
+    )
+
+    with pytest.raises(
+        daemon.DaemonError, match="version does not match"
+    ) as exc_info:
+        daemon.health_daemon(project=project)
+
+    assert token not in str(exc_info.value)
+
+
 def test_health_daemon_rejects_stopped_daemon(
     daemon_home, project, monkeypatch
 ):
@@ -806,6 +832,37 @@ def test_stop_refuses_pid_owned_by_another_process(
     assert paths["state"].exists()
 
 
+def test_stop_expected_instance_id_refuses_replacement_instance_before_pid_checks(
+    daemon_home, project, monkeypatch
+):
+    paths, _ = _state(project, instance_id="replacement-instance")
+    monkeypatch.setattr(
+        daemon,
+        "_pid_is_alive",
+        lambda pid: pytest.fail("replacement pid must not be inspected"),
+    )
+    monkeypatch.setattr(
+        daemon,
+        "_process_owns_instance",
+        lambda *args: pytest.fail("replacement ownership must not be inspected"),
+    )
+    monkeypatch.setattr(
+        daemon.os,
+        "kill",
+        lambda *args: pytest.fail("replacement daemon must not be signalled"),
+    )
+
+    with pytest.raises(
+        daemon.DaemonOwnershipError, match="recorded instance changed"
+    ):
+        daemon.stop_daemon(
+            project=project,
+            expected_instance_id="original-instance",
+        )
+
+    assert paths["state"].exists()
+
+
 def test_stop_sends_sigterm_waits_and_removes_state(
     daemon_home, project, monkeypatch
 ):
@@ -816,7 +873,10 @@ def test_stop_sends_sigterm_waits_and_removes_state(
     killed = []
     monkeypatch.setattr(daemon.os, "kill", lambda pid, sig: killed.append((pid, sig)))
 
-    result = daemon.stop_daemon(project=project)
+    result = daemon.stop_daemon(
+        project=project,
+        expected_instance_id=payload["instance_id"],
+    )
 
     assert result["status"] == "stopped"
     assert result["pid"] == payload["pid"]
@@ -840,6 +900,95 @@ def test_projects_have_isolated_state_and_log_paths(
     assert first_paths["token"] != second_paths["token"]
     assert first_paths["port"] != second_paths["port"]
     assert first_paths["state"].parent == second_paths["state"].parent == daemon_home
+
+
+def test_daemon_directory_symlink_is_rejected_without_changing_target(
+    daemon_home, project, tmp_path
+):
+    target = tmp_path / "outside-daemons"
+    target.mkdir(mode=0o755)
+    marker = target / "marker"
+    marker.write_text("outside\n", encoding="utf-8")
+    daemon_home.parent.mkdir(parents=True)
+    daemon_home.symlink_to(target, target_is_directory=True)
+    original_mode = stat.S_IMODE(target.stat().st_mode)
+
+    with pytest.raises(daemon.DaemonError, match="safe real directory"):
+        daemon.status_daemon(project=project)
+
+    assert marker.read_text(encoding="utf-8") == "outside\n"
+    assert stat.S_IMODE(target.stat().st_mode) == original_mode
+    assert daemon_home.is_symlink()
+
+
+def test_daemon_directory_permissions_are_narrowed_through_verified_fd(
+    daemon_home
+):
+    daemon_home.mkdir(parents=True, mode=0o700)
+    daemon_home.chmod(0o777)
+
+    assert daemon._ensure_daemon_dir() == daemon_home
+    assert stat.S_IMODE(daemon_home.stat().st_mode) == 0o700
+
+
+@pytest.mark.parametrize("artifact", ["lock", "log", "state"])
+def test_daemon_regular_paths_reject_symlinks_without_changing_target(
+    daemon_home, project, tmp_path, artifact
+):
+    paths = daemon._project_paths(project.resolve())
+    target = tmp_path / f"outside-{artifact}"
+    target.write_text("outside\n", encoding="utf-8")
+    target.chmod(0o644)
+    paths[artifact].symlink_to(target)
+    original_mode = stat.S_IMODE(target.stat().st_mode)
+
+    with pytest.raises(daemon.DaemonError):
+        if artifact == "lock":
+            daemon.status_daemon(project=project)
+        elif artifact == "log":
+            daemon._open_secure_append(paths["log"])
+        else:
+            daemon.status_daemon(project=project)
+
+    assert target.read_text(encoding="utf-8") == "outside\n"
+    assert stat.S_IMODE(target.stat().st_mode) == original_mode
+    assert paths[artifact].is_symlink()
+
+
+def test_state_write_rejects_symlink_without_changing_target(
+    daemon_home, project, tmp_path
+):
+    paths = daemon._project_paths(project.resolve())
+    target = tmp_path / "outside-state"
+    target.write_text("outside\n", encoding="utf-8")
+    target.chmod(0o644)
+    paths["state"].symlink_to(target)
+    original_mode = stat.S_IMODE(target.stat().st_mode)
+
+    with pytest.raises(daemon.DaemonError, match="unsafe daemon lifecycle state"):
+        daemon._write_state(paths["state"], {"new": "state"})
+
+    assert target.read_text(encoding="utf-8") == "outside\n"
+    assert stat.S_IMODE(target.stat().st_mode) == original_mode
+    assert paths["state"].is_symlink()
+
+
+@pytest.mark.parametrize("artifact", ["lock", "log", "state"])
+def test_daemon_regular_paths_reject_non_regular_files(
+    daemon_home, project, artifact
+):
+    paths = daemon._project_paths(project.resolve())
+    paths[artifact].mkdir()
+
+    with pytest.raises(daemon.DaemonError):
+        if artifact == "lock":
+            daemon.status_daemon(project=project)
+        elif artifact == "log":
+            daemon._open_secure_append(paths["log"])
+        else:
+            daemon.status_daemon(project=project)
+
+    assert paths[artifact].is_dir()
 
 
 def test_default_project_ports_are_stable_and_isolated(tmp_path):
@@ -1014,6 +1163,67 @@ def test_port_profile_symlink_is_rejected_without_following_target(
 
     assert str(paths["port"]) not in str(exc_info.value)
     assert target.read_text(encoding="ascii") == "54321\n"
+
+
+@pytest.mark.parametrize("artifact", ["state", "port"])
+def test_atomic_writes_fsync_file_then_replace_then_parent_directory(
+    daemon_home, project, monkeypatch, artifact
+):
+    paths = daemon._project_paths(project.resolve())
+    events = []
+    original_fsync = daemon.os.fsync
+    original_replace = daemon.os.replace
+
+    def recording_fsync(fd):
+        file_type = daemon.os.fstat(fd).st_mode
+        events.append(
+            "directory_fsync" if stat.S_ISDIR(file_type) else "file_fsync"
+        )
+        return original_fsync(fd)
+
+    def recording_replace(source, destination):
+        events.append("replace")
+        return original_replace(source, destination)
+
+    monkeypatch.setattr(daemon.os, "fsync", recording_fsync)
+    monkeypatch.setattr(daemon.os, "replace", recording_replace)
+
+    if artifact == "state":
+        daemon._write_state(paths["state"], {"value": "new"})
+    else:
+        daemon._write_port_profile(paths["port"], 54321)
+
+    assert events == ["file_fsync", "replace", "directory_fsync"]
+
+
+@pytest.mark.parametrize("artifact", ["state", "port"])
+def test_parent_fsync_failure_reports_uncertain_durability_after_replace(
+    daemon_home, project, monkeypatch, artifact
+):
+    paths = daemon._project_paths(project.resolve())
+    original_fsync = daemon.os.fsync
+
+    def fail_directory_fsync(fd):
+        if stat.S_ISDIR(daemon.os.fstat(fd).st_mode):
+            raise OSError("directory fsync failed")
+        return original_fsync(fd)
+
+    monkeypatch.setattr(daemon.os, "fsync", fail_directory_fsync)
+
+    with pytest.raises(
+        daemon.DaemonError, match=r"was replaced.*durability is uncertain"
+    ):
+        if artifact == "state":
+            daemon._write_state(paths["state"], {"value": "committed"})
+        else:
+            daemon._write_port_profile(paths["port"], 54321)
+
+    if artifact == "state":
+        assert json.loads(paths["state"].read_text(encoding="utf-8")) == {
+            "value": "committed"
+        }
+    else:
+        assert paths["port"].read_text(encoding="ascii") == "54321\n"
 
 
 def test_process_ownership_requires_matching_hidden_id(monkeypatch):

@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import sys
 import tomllib
@@ -447,6 +448,23 @@ def test_cli_serve_passes_explicit_http_options(monkeypatch):
             "bearer_token": "environment-secret",
         }
     ]
+
+
+def test_cli_serve_removes_bearer_token_from_environment_before_server_start(
+    monkeypatch,
+):
+    calls = []
+    monkeypatch.setenv("NOMAD_MCP_BEARER_TOKEN", "environment-secret")
+
+    def server_main(**kwargs):
+        assert "NOMAD_MCP_BEARER_TOKEN" not in os.environ
+        calls.append(kwargs)
+
+    monkeypatch.setattr("nomad.server.main", server_main)
+
+    assert main(["serve"]) is None
+    assert calls[0]["bearer_token"] == "environment-secret"
+    assert "NOMAD_MCP_BEARER_TOKEN" not in os.environ
 
 
 def test_cli_serve_claims_daemon_state_before_starting_server(monkeypatch):
