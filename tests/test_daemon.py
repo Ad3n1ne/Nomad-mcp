@@ -59,6 +59,9 @@ def _state(project: Path, *, pid=4242, instance_id="instance-1"):
         "started_at": "2026-07-24T00:00:00+00:00",
         "instance_id": instance_id,
         "log_path": str(paths["log"]),
+        "allow_remote": False,
+        "auth": True,
+        "token_env_var": daemon._project_token_env_var(project.resolve()),
     }
     daemon._write_state(paths["state"], payload)
     return paths, payload
@@ -490,6 +493,121 @@ def test_status_removes_dead_stale_state(daemon_home, project, monkeypatch):
     assert not paths["state"].exists()
 
 
+def test_health_daemon_runs_authenticated_mcp_health(
+    daemon_home, project, monkeypatch
+):
+    paths, payload = _state(project)
+    token = "project-health-token"
+    paths["token"].write_text(f"{token}\n", encoding="ascii")
+    monkeypatch.setattr(daemon, "_pid_is_alive", lambda pid: True)
+    monkeypatch.setattr(daemon, "_process_owns_instance", lambda *args: True)
+    health_calls = []
+
+    def healthy(url, bearer_token, *, timeout):
+        health_calls.append((url, bearer_token, timeout))
+        return {"pid": payload["pid"], "version": payload["version"]}
+
+    monkeypatch.setattr(daemon, "_mcp_health_data", healthy)
+
+    result = daemon.health_daemon(project=project, timeout=0.75)
+
+    assert result == {
+        "ok": True,
+        "status": "healthy",
+        "project_root": str(project.resolve()),
+        "pid": payload["pid"],
+        "version": payload["version"],
+        "url": payload["url"],
+    }
+    assert health_calls == [(payload["url"], token, 0.75)]
+    assert token not in json.dumps(result)
+    assert "token" not in result
+    assert "token_path" not in result
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        RuntimeError("401 unauthorized: project-health-token"),
+        TimeoutError("timed out with project-health-token"),
+    ],
+    ids=["401", "timeout"],
+)
+def test_health_daemon_wraps_transport_failures_without_token_leak(
+    daemon_home, project, monkeypatch, failure
+):
+    paths, _ = _state(project)
+    token = "project-health-token"
+    paths["token"].write_text(f"{token}\n", encoding="ascii")
+    monkeypatch.setattr(daemon, "_pid_is_alive", lambda pid: True)
+    monkeypatch.setattr(daemon, "_process_owns_instance", lambda *args: True)
+    monkeypatch.setattr(
+        daemon,
+        "_mcp_health_data",
+        lambda *args, **kwargs: (_ for _ in ()).throw(failure),
+    )
+
+    with pytest.raises(
+        daemon.DaemonError, match="authenticated daemon MCP health check failed"
+    ) as exc_info:
+        daemon.health_daemon(project=project, timeout=0.25)
+
+    assert token not in str(exc_info.value)
+    assert "401 unauthorized" not in str(exc_info.value)
+
+
+def test_health_daemon_rejects_health_pid_mismatch_without_token_leak(
+    daemon_home, project, monkeypatch
+):
+    paths, payload = _state(project)
+    token = "project-health-token"
+    paths["token"].write_text(f"{token}\n", encoding="ascii")
+    monkeypatch.setattr(daemon, "_pid_is_alive", lambda pid: True)
+    monkeypatch.setattr(daemon, "_process_owns_instance", lambda *args: True)
+    monkeypatch.setattr(
+        daemon,
+        "_mcp_health_data",
+        lambda *args, **kwargs: {"pid": payload["pid"] + 1},
+    )
+
+    with pytest.raises(daemon.DaemonError, match="pid does not match") as exc_info:
+        daemon.health_daemon(project=project)
+
+    assert token not in str(exc_info.value)
+
+
+def test_health_daemon_rejects_stopped_daemon(
+    daemon_home, project, monkeypatch
+):
+    monkeypatch.setattr(
+        daemon,
+        "_mcp_health_data",
+        lambda *args, **kwargs: pytest.fail("stopped daemon must not be contacted"),
+    )
+
+    with pytest.raises(daemon.DaemonError, match="not running"):
+        daemon.health_daemon(project=project)
+
+
+def test_health_daemon_rejects_ownership_mismatch(
+    daemon_home, project, monkeypatch
+):
+    paths, _ = _state(project)
+    paths["token"].write_text("project-health-token\n", encoding="ascii")
+    monkeypatch.setattr(daemon, "_pid_is_alive", lambda pid: True)
+    monkeypatch.setattr(daemon, "_process_owns_instance", lambda *args: False)
+    monkeypatch.setattr(
+        daemon,
+        "_mcp_health_data",
+        lambda *args, **kwargs: pytest.fail(
+            "unowned daemon endpoint must not be contacted"
+        ),
+    )
+
+    with pytest.raises(daemon.DaemonError, match="ownership check failed"):
+        daemon.health_daemon(project=project)
+
+
 def test_failed_start_returns_error_and_leaves_no_state(
     daemon_home, project, monkeypatch
 ):
@@ -747,7 +865,7 @@ def test_non_loopback_and_legacy_allow_remote_are_rejected(daemon_home, project)
         daemon.start_daemon(project=project, allow_remote=True)
 
 
-def test_restart_legacy_remote_state_falls_back_to_loopback(
+def test_restart_rejects_legacy_remote_state_and_starts_cleanly(
     daemon_home, project, monkeypatch
 ):
     paths, payload = _state(project)
@@ -769,9 +887,10 @@ def test_restart_legacy_remote_state_falls_back_to_loopback(
 
     result = daemon.restart_daemon(project=project)
 
-    assert result["restarted"] is True
+    assert result["restarted"] is False
     assert starts[0]["host"] == daemon.DEFAULT_HOST
     assert "allow_remote" not in starts[0]
+    assert not paths["state"].exists()
 
 
 def test_auto_port_scans_past_listening_hash_candidate(
@@ -1092,3 +1211,86 @@ def test_valid_state_allows_only_pid_zero_for_launching(daemon_home, project):
     payload["lifecycle"] = "starting"
     payload["pid"] = 0
     assert daemon._valid_state(payload, project.resolve()) is False
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("host", "0.0.0.0"),
+        ("port", 8766),
+        ("path", "/other"),
+        ("url", "http://127.0.0.1:8765/other"),
+        ("token_env_var", "NOMAD_MCP_BEARER_TOKEN_ATTACKER"),
+        ("log_path", "/tmp/attacker.log"),
+    ],
+)
+def test_status_rejects_tampered_identity_fields_and_removes_state(
+    daemon_home, project, monkeypatch, field, value
+):
+    paths, payload = _state(project)
+    payload[field] = value
+    daemon._write_state(paths["state"], payload)
+    monkeypatch.setattr(
+        daemon,
+        "_pid_is_alive",
+        lambda pid: pytest.fail("invalid state pid must not be inspected"),
+    )
+    monkeypatch.setattr(
+        daemon,
+        "_process_owns_instance",
+        lambda *args: pytest.fail("invalid state ownership must not be inspected"),
+    )
+
+    result = daemon.status_daemon(project=project)
+
+    assert result["status"] == "stopped"
+    assert result["running"] is False
+    assert not paths["state"].exists()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["missing_token_env_var", "auth_false", "allow_remote_true"],
+)
+def test_status_rejects_unsafe_auth_identity_and_removes_state(
+    daemon_home, project, monkeypatch, mutation
+):
+    paths, payload = _state(project)
+    if mutation == "missing_token_env_var":
+        payload.pop("token_env_var")
+    elif mutation == "auth_false":
+        payload["auth"] = False
+    else:
+        payload["allow_remote"] = True
+    daemon._write_state(paths["state"], payload)
+    monkeypatch.setattr(
+        daemon,
+        "_pid_is_alive",
+        lambda pid: pytest.fail("invalid state pid must not be inspected"),
+    )
+    monkeypatch.setattr(
+        daemon,
+        "_process_owns_instance",
+        lambda *args: pytest.fail("invalid state ownership must not be inspected"),
+    )
+
+    result = daemon.status_daemon(project=project)
+
+    assert result["status"] == "stopped"
+    assert result["running"] is False
+    assert not paths["state"].exists()
+
+
+def test_valid_legacy_0_2_1_state_remains_readable(
+    daemon_home, project, monkeypatch
+):
+    paths, payload = _state(project)
+    daemon._write_state(paths["state"], payload)
+    monkeypatch.setattr(daemon, "_pid_is_alive", lambda pid: True)
+    monkeypatch.setattr(daemon, "_process_owns_instance", lambda *args: True)
+
+    result = daemon.status_daemon(project=project)
+
+    assert result["status"] == "running"
+    assert result["pid"] == payload["pid"]
+    assert paths["state"].exists()

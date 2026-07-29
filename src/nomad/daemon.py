@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import math
 import os
 import secrets
 import shlex
@@ -120,6 +121,69 @@ def status_daemon(
 
         state = _recover_starting_state(state, paths)
         return _state_result(state, already_running=True)
+
+
+def health_daemon(
+    *,
+    project: str | os.PathLike[str] | None = None,
+    timeout: float = START_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Checks daemon identity and authenticated MCP health for a project."""
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+        or not math.isfinite(timeout)
+        or timeout <= 0
+    ):
+        raise DaemonError("daemon health timeout must be a positive finite number")
+
+    project_root = resolve_project(project)
+    try:
+        status = status_daemon(project=project_root)
+    except Exception:
+        raise DaemonError("cannot determine daemon status for health check") from None
+
+    if status.get("status") == "ownership_mismatch":
+        raise DaemonError("daemon ownership check failed") from None
+    if status.get("status") != "running" or status.get("running") is not True:
+        raise DaemonError("daemon is not running and ready for health check") from None
+    try:
+        state_pid = int(status["pid"])
+        state_url = str(status["url"])
+        state_version = str(status["version"])
+    except (KeyError, TypeError, ValueError):
+        raise DaemonError("daemon status is invalid for health check") from None
+
+    try:
+        bearer_token = read_daemon_token(project=project_root)
+    except Exception:
+        raise DaemonError(
+            "cannot read daemon authentication token for health check"
+        ) from None
+
+    try:
+        health_data = _mcp_health_data(
+            state_url,
+            bearer_token,
+            timeout=float(timeout),
+        )
+    except Exception:
+        raise DaemonError("authenticated daemon MCP health check failed") from None
+
+    if not isinstance(health_data, dict) or health_data.get("pid") != state_pid:
+        raise DaemonError(
+            "daemon MCP health pid does not match recorded daemon pid"
+        ) from None
+
+    result = {
+        "ok": True,
+        "status": "healthy",
+        "project_root": str(project_root),
+        "pid": state_pid,
+        "version": state_version,
+        "url": state_url,
+    }
+    return result
 
 
 def stop_daemon(
@@ -468,7 +532,12 @@ def _stop_locked(
 
 
 def _project_paths(project_root: Path) -> dict[str, Path]:
-    daemon_dir = _ensure_daemon_dir()
+    return _project_paths_for_dir(project_root, _ensure_daemon_dir())
+
+
+def _project_paths_for_dir(
+    project_root: Path, daemon_dir: Path
+) -> dict[str, Path]:
     project_hash = _project_hash(project_root)
     return {
         "state": daemon_dir / f"{project_hash}.json",
@@ -760,6 +829,9 @@ def _valid_state(payload: Any, project_root: Path) -> bool:
         "started_at": str,
         "instance_id": str,
         "log_path": str,
+        "allow_remote": bool,
+        "auth": bool,
+        "token_env_var": str,
     }
     if payload.get("schema_version") != SCHEMA_VERSION:
         return False
@@ -781,22 +853,29 @@ def _valid_state(payload: Any, project_root: Path) -> bool:
             return False
     elif payload["pid"] <= 0:
         return False
-    if not 1 <= payload["port"] <= 65535:
+    try:
+        _validate_endpoint(payload["host"], payload["port"], payload["path"])
+    except DaemonError:
         return False
-    if not payload["path"].strip():
+    if payload["host"] != payload["host"].strip():
+        return False
+    if not is_loopback_host(payload["host"]):
+        return False
+    if payload["url"] != _build_url(
+        payload["host"], payload["port"], payload["path"]
+    ):
+        return False
+    expected_paths = _project_paths_for_dir(project_root, DEFAULT_DAEMONS_DIR)
+    if payload["log_path"] != str(expected_paths["log"]):
         return False
     if not payload["instance_id"].strip():
         return False
-    for optional_key, expected_type in {
-        "allow_remote": bool,
-        "auth": bool,
-        "token_env_var": str,
-        "ready_at": str,
-    }.items():
-        if optional_key in payload and not isinstance(
-            payload[optional_key], expected_type
-        ):
-            return False
+    if "ready_at" in payload and not isinstance(payload["ready_at"], str):
+        return False
+    if payload["allow_remote"] is not False or payload["auth"] is not True:
+        return False
+    if payload["token_env_var"] != _project_token_env_var(project_root):
+        return False
     return True
 
 
