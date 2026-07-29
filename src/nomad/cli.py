@@ -75,6 +75,8 @@ def main(argv: list[str] | None = None) -> int | None:
         return None
     if args.command == "daemon":
         return _run_daemon_command(args)
+    if args.command == "codex":
+        return _run_codex_command(args)
 
     parser.print_help()
     return 0
@@ -201,6 +203,26 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     _add_project_argument(daemon_token_parser)
+
+    codex_parser = subparsers.add_parser(
+        "codex", help="Configure Nomad's MCP integration for Codex CLI."
+    )
+    codex_subparsers = codex_parser.add_subparsers(
+        dest="codex_command",
+        required=True,
+    )
+    for codex_command in ("setup", "doctor", "repair"):
+        command_parser = codex_subparsers.add_parser(
+            codex_command,
+            help=f"{codex_command.capitalize()} the Codex CLI integration.",
+        )
+        _add_project_argument(command_parser)
+        command_parser.add_argument(
+            "--name",
+            type=_valid_mcp_name,
+            default="nomad",
+            help="MCP server name using only letters, digits, '_' or '-' (default: nomad).",
+        )
     return parser
 
 
@@ -244,6 +266,59 @@ def _run_daemon_command(args: argparse.Namespace) -> int:
 
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
+
+
+def _run_codex_command(args: argparse.Namespace) -> int:
+    from nomad.codex import (
+        CodexConfigError,
+        doctor_codex,
+        repair_codex,
+        setup_codex,
+    )
+
+    commands = {
+        "setup": setup_codex,
+        "doctor": doctor_codex,
+        "repair": repair_codex,
+    }
+    try:
+        result = commands[args.codex_command](
+            project=args.project,
+            name=args.name,
+        )
+    except CodexConfigError as exc:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error_type": exc.error_type,
+                    "message": str(exc),
+                    "details": _redact_codex_details(exc.details),
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+        return 1
+
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 1 if result.get("ok") is False else 0
+
+
+def _redact_codex_details(value: Any, *, key: str | None = None) -> Any:
+    if key is not None and "token" in key.lower():
+        return "[redacted]"
+    if isinstance(value, dict):
+        return {
+            item_key: _redact_codex_details(item_value, key=str(item_key))
+            for item_key, item_value in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_codex_details(item) for item in value]
+    if isinstance(value, tuple):
+        return [_redact_codex_details(item) for item in value]
+    return value
 
 
 def _valid_port(value: str) -> int:

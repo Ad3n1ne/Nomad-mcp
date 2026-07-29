@@ -1,6 +1,8 @@
 import json
 import subprocess
+import sys
 import tomllib
+import types
 
 import pytest
 
@@ -9,11 +11,220 @@ from nomad import daemon
 from nomad.cli import main
 
 
+@pytest.fixture
+def codex_api(monkeypatch):
+    calls = []
+    module = types.ModuleType("nomad.codex")
+
+    class CodexConfigError(RuntimeError):
+        def __init__(self, message, *, error_type, details=None):
+            super().__init__(message)
+            self.error_type = error_type
+            self.details = details or {}
+
+    module.CodexConfigError = CodexConfigError
+    for command in ("setup", "doctor", "repair"):
+        setattr(
+            module,
+            f"{command}_codex",
+            lambda command=command, **kwargs: calls.append((command, kwargs))
+            or {"ok": True, "command": command},
+        )
+    monkeypatch.setitem(sys.modules, "nomad.codex", module)
+    return module, calls
+
+
 def test_cli_version(capsys):
     assert main(["--version"]) == 0
 
     out = capsys.readouterr().out.strip()
     assert out == __version__
+
+
+def test_cli_codex_requires_subcommand():
+    with pytest.raises(SystemExit) as exc_info:
+        main(["codex"])
+
+    assert exc_info.value.code == 2
+
+
+@pytest.mark.parametrize("command", ["setup", "doctor", "repair"])
+def test_cli_codex_dispatches_project_and_name(codex_api, capsys, command):
+    _, calls = codex_api
+
+    assert main(
+        [
+            "codex",
+            command,
+            "--project",
+            "/tmp/project",
+            "--name",
+            "nomad_project-1",
+        ]
+    ) == 0
+
+    assert calls == [
+        (
+            command,
+            {
+                "project": "/tmp/project",
+                "name": "nomad_project-1",
+            },
+        )
+    ]
+    assert json.loads(capsys.readouterr().out) == {
+        "ok": True,
+        "command": command,
+    }
+
+
+def test_cli_codex_uses_default_parameters(codex_api, capsys):
+    _, calls = codex_api
+
+    assert main(["codex", "setup"]) == 0
+
+    assert calls == [("setup", {"project": None, "name": "nomad"})]
+    capsys.readouterr()
+
+
+@pytest.mark.parametrize("command", ["setup", "doctor", "repair"])
+def test_cli_codex_rejects_invalid_name(codex_api, command):
+    with pytest.raises(SystemExit) as exc_info:
+        main(["codex", command, "--name", "nomad.project"])
+
+    assert exc_info.value.code == 2
+
+
+def test_cli_codex_success_json_is_pretty_and_sorted(codex_api, capsys):
+    module, _ = codex_api
+    module.doctor_codex = lambda **kwargs: {
+        "z": {"ready": True},
+        "ok": True,
+        "a": 1,
+    }
+
+    assert main(["codex", "doctor"]) == 0
+
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out == (
+        '{\n'
+        '  "a": 1,\n'
+        '  "ok": true,\n'
+        '  "z": {\n'
+        '    "ready": true\n'
+        '  }\n'
+        '}\n'
+    )
+
+
+def test_cli_codex_false_result_exits_one(codex_api, capsys):
+    module, _ = codex_api
+    module.repair_codex = lambda **kwargs: {
+        "ok": False,
+        "error_type": "repair_failed",
+    }
+
+    assert main(["codex", "repair"]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert json.loads(captured.out) == {
+        "ok": False,
+        "error_type": "repair_failed",
+    }
+
+
+def test_cli_codex_config_error_is_structured(codex_api, capsys):
+    module, _ = codex_api
+
+    def fail(**kwargs):
+        raise module.CodexConfigError(
+            "Codex config is invalid",
+            error_type="invalid_codex_config",
+            details={"path": "/tmp/config.toml", "line": 7},
+        )
+
+    module.setup_codex = fail
+
+    assert main(["codex", "setup"]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert json.loads(captured.err) == {
+        "ok": False,
+        "error_type": "invalid_codex_config",
+        "message": "Codex config is invalid",
+        "details": {"path": "/tmp/config.toml", "line": 7},
+    }
+
+
+def test_cli_codex_error_does_not_leak_traceback_or_token(codex_api, capsys):
+    module, _ = codex_api
+
+    def fail(**kwargs):
+        raise module.CodexConfigError(
+            "Codex config update failed",
+            error_type="write_failed",
+            details={
+                "bearer_token": "super-secret-token",
+                "nested": {"token": "nested-secret"},
+            },
+        )
+
+    module.repair_codex = fail
+
+    assert main(["codex", "repair"]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Traceback" not in captured.err
+    assert "super-secret-token" not in captured.err
+    assert "nested-secret" not in captured.err
+    assert json.loads(captured.err)["details"] == {
+        "bearer_token": "[redacted]",
+        "nested": {"token": "[redacted]"},
+    }
+
+
+def test_cli_help_does_not_import_codex_or_daemon(monkeypatch, capsys):
+    imported = []
+    original_import = __import__
+
+    def tracking_import(name, *args, **kwargs):
+        if name in {"nomad.codex", "nomad.daemon"}:
+            imported.append(name)
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", tracking_import)
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["--help"])
+
+    assert exc_info.value.code == 0
+    assert imported == []
+    capsys.readouterr()
+
+
+def test_cli_no_args_stdio_does_not_import_codex_or_daemon(monkeypatch):
+    server_calls = []
+    server_module = types.ModuleType("nomad.server")
+    server_module.main = lambda: server_calls.append("main")
+    monkeypatch.setitem(sys.modules, "nomad.server", server_module)
+
+    imported = []
+    original_import = __import__
+
+    def tracking_import(name, *args, **kwargs):
+        if name in {"nomad.codex", "nomad.daemon"}:
+            imported.append(name)
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", tracking_import)
+
+    assert main([]) is None
+    assert server_calls == ["main"]
+    assert imported == []
 
 
 def test_cli_schema(capsys):
