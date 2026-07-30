@@ -1134,12 +1134,8 @@ def _wait_for_child_claim(
 
 
 def _process_owns_instance(pid: int, instance_id: str) -> bool:
-    command = _process_command(pid)
-    if not command:
-        return False
-    try:
-        parts = shlex.split(command)
-    except ValueError:
+    parts = _process_arguments(pid)
+    if not parts:
         return False
     if "serve" not in parts or "nomad.cli" not in parts:
         return False
@@ -1151,10 +1147,33 @@ def _process_owns_instance(pid: int, instance_id: str) -> bool:
     return False
 
 
+def _process_arguments(pid: int) -> list[str] | None:
+    proc_arguments = _process_arguments_from_proc(pid)
+    if proc_arguments:
+        return proc_arguments
+
+    command = _process_command(pid)
+    if not command:
+        return None
+    try:
+        return shlex.split(command)
+    except ValueError:
+        return None
+
+
+def _process_arguments_from_proc(pid: int) -> list[str] | None:
+    try:
+        raw = (Path("/proc") / str(pid) / "cmdline").read_bytes()
+    except OSError:
+        return None
+    arguments = [os.fsdecode(part) for part in raw.split(b"\0") if part]
+    return arguments or None
+
+
 def _process_command(pid: int) -> str | None:
     try:
         completed = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "command="],
+            ["ps", "-ww", "-p", str(pid), "-o", "command="],
             capture_output=True,
             text=True,
             timeout=2,

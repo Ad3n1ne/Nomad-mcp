@@ -1229,6 +1229,11 @@ def test_parent_fsync_failure_reports_uncertain_durability_after_replace(
 def test_process_ownership_requires_matching_hidden_id(monkeypatch):
     monkeypatch.setattr(
         daemon,
+        "_process_arguments_from_proc",
+        lambda pid: None,
+    )
+    monkeypatch.setattr(
+        daemon,
         "_process_command",
         lambda pid: (
             "/usr/bin/python3 -m nomad.cli serve --host 127.0.0.1 "
@@ -1238,6 +1243,51 @@ def test_process_ownership_requires_matching_hidden_id(monkeypatch):
 
     assert daemon._process_owns_instance(10, "expected") is True
     assert daemon._process_owns_instance(10, "other") is False
+
+
+def test_process_ownership_prefers_untruncated_proc_arguments(monkeypatch):
+    monkeypatch.setattr(
+        daemon,
+        "_process_arguments_from_proc",
+        lambda pid: [
+            "/usr/bin/python3",
+            "-m",
+            "nomad.cli",
+            "serve",
+            "--daemon-state",
+            "/tmp/" + ("long-path/" * 20) + "state.json",
+            "--daemon-id",
+            "expected",
+        ],
+    )
+    monkeypatch.setattr(
+        daemon,
+        "_process_command",
+        lambda pid: pytest.fail("ps fallback must not run when /proc is available"),
+    )
+
+    assert daemon._process_owns_instance(10, "expected") is True
+    assert daemon._process_owns_instance(10, "other") is False
+
+
+def test_process_command_requests_untruncated_ps_output(monkeypatch):
+    observed = {}
+
+    def run(command, **kwargs):
+        observed["command"] = command
+        return subprocess.CompletedProcess(command, 0, stdout="python -m nomad.cli")
+
+    monkeypatch.setattr(daemon.subprocess, "run", run)
+
+    assert daemon._process_command(10) == "python -m nomad.cli"
+    assert observed["command"] == [
+        "ps",
+        "-ww",
+        "-p",
+        "10",
+        "-o",
+        "command=",
+    ]
 
 
 def test_pid_alive_treats_zombie_as_stopped(monkeypatch):
