@@ -44,48 +44,23 @@ pipx install nomad-mcp
 
 ## Codex Setup
 
-Install nomad with `pipx`, then start a daemon in the local project:
+`nomad codex setup` is an optional Codex configuration adapter, not a protocol
+requirement. Any MCP host can use Nomad through the standard stdio or
+Streamable HTTP transports without Codex configuration.
+
+From the project you want Codex to control, run:
 
 ```bash
-nomad daemon start --project "$PWD"
-nomad daemon status --project "$PWD"
+nomad codex setup --project "$PWD"
+nomad codex doctor --project "$PWD"
 ```
 
-Generate the project-specific Codex configuration:
+The adapter starts or repairs a project daemon and writes only the trusted
+project's `.codex/config.toml`. It never changes user-level Codex configuration
+or project trust. Resolve any reported global conflict, then fully restart
+Codex so it loads the project MCP entry.
 
-```bash
-nomad client-config \
-  --transport http \
-  --project "$PWD" \
-  --name nomad-myproject \
-  --format toml
-```
-
-The generated configuration references a bearer-token environment variable
-instead of storing the token. Export it before starting Codex:
-
-```bash
-export NOMAD_TOKEN_ENV_VAR="$(nomad daemon status --project "$PWD" |
-  python -c 'import json,sys; print(json.load(sys.stdin)["token_env_var"])')"
-export "$NOMAD_TOKEN_ENV_VAR=$(nomad daemon token --project "$PWD")"
-codex
-```
-
-For Codex Desktop on macOS, set the same value with `launchctl setenv`, then
-fully quit and reopen Codex:
-
-```bash
-launchctl setenv "$NOMAD_TOKEN_ENV_VAR" \
-  "$(nomad daemon token --project "$PWD")"
-```
-
-See [Persistent MCP Daemon](docs/09-persistent-daemon.md) for direct
-`codex mcp add` commands, project isolation, lifecycle operations, upgrades,
-security boundaries, and troubleshooting.
-
-### Stdio Compatibility
-
-Clients without Streamable HTTP support can launch nomad directly:
+Other MCP hosts can launch Nomad directly over stdio:
 
 ```json
 {
@@ -98,16 +73,9 @@ Clients without Streamable HTTP support can launch nomad directly:
 }
 ```
 
-Equivalent TOML:
-
-```toml
-[mcp_servers.nomad]
-command = "uvx"
-args = ["--from", "nomad-mcp", "nomad"]
-startup_timeout_sec = 120
-```
-
-`nomad client-config` can generate JSON or TOML snippets for both transports.
+Use `nomad client-config` to generate JSON or TOML for standard stdio or
+Streamable HTTP clients. See [Persistent MCP Daemon](docs/09-persistent-daemon.md)
+for manual registration, lifecycle, security, and troubleshooting.
 
 ## Quick Start
 

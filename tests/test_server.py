@@ -178,6 +178,42 @@ def test_server_main_accepts_explicit_transport_and_http_options(monkeypatch):
     }
 
 
+@pytest.mark.parametrize("transport", ["sse", "streamable-http"])
+@pytest.mark.parametrize("bearer_token", [None, "", "   "])
+def test_server_main_rejects_http_without_bearer_token(
+    monkeypatch,
+    transport,
+    bearer_token,
+):
+    created = []
+    monkeypatch.setattr(
+        "nomad.server.create_server",
+        lambda **kwargs: created.append(kwargs),
+    )
+    monkeypatch.setattr("nomad.server.log_server_startup", lambda *_: None)
+
+    with pytest.raises(ValueError, match="bearer token is required"):
+        main(transport=transport, bearer_token=bearer_token)
+
+    assert created == []
+
+
+@pytest.mark.parametrize("app_factory", ["streamable_http_app", "sse_app"])
+def test_server_object_rejects_unauthenticated_http_app(app_factory):
+    server = create_server()
+
+    with pytest.raises(ValueError, match="bearer token is required"):
+        getattr(server, app_factory)()
+
+
+@pytest.mark.parametrize("transport", ["sse", "streamable-http"])
+def test_server_object_rejects_unauthenticated_http_run(transport):
+    server = create_server()
+
+    with pytest.raises(ValueError, match="bearer token is required"):
+        server.run(transport=transport)
+
+
 def test_server_main_handles_keyboard_interrupt_and_keeps_shutdown_hook(monkeypatch):
     registered = []
 
@@ -195,7 +231,10 @@ def test_server_main_handles_keyboard_interrupt_and_keeps_shutdown_hook(monkeypa
         lambda callback: registered.append(callback),
     )
 
-    assert main(transport="streamable-http") is None
+    assert main(
+        transport="streamable-http",
+        bearer_token="test-token",
+    ) is None
     assert registered == [log_server_shutdown]
 
 
@@ -328,6 +367,87 @@ def test_safe_resource_catches_exception_and_logs_traceback(tmp_path, monkeypatc
     log_content = log_path.read_text(encoding="utf-8")
     assert "resource exception name=broken_resource" in log_content
     assert "ValueError: resource broke" in log_content
+
+
+def test_safe_tool_returns_logging_unavailable_without_executing(
+    monkeypatch, capsys
+):
+    executed = []
+
+    def operation(target: str = "default") -> str:
+        executed.append(target)
+        return "{}"
+
+    def unavailable():
+        raise PermissionError(
+            "unsafe path contains sk-SYNTHETICTESTTOKEN000000000000"
+        )
+
+    monkeypatch.setattr("nomad.server.get_mcp_logger", unavailable)
+
+    result = json.loads(run_async(_safe_tool(operation), target="gpu"))
+
+    assert result["ok"] is False
+    assert result["tool"] == "operation"
+    assert result["target"] == "gpu"
+    assert result["error_type"] == "logging_unavailable"
+    assert result["recoverable"] is True
+    assert executed == []
+    assert "SYNTHETICTESTTOKEN" not in result["diagnostics"][0]
+    assert "sk-[REDACTED]" in result["diagnostics"][0]
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+
+def test_safe_resource_returns_logging_unavailable_without_executing(monkeypatch):
+    executed = []
+
+    def resource() -> str:
+        executed.append(True)
+        return "{}"
+
+    def unavailable():
+        raise OSError("synthetic logging failure")
+
+    monkeypatch.setattr("nomad.server.get_mcp_logger", unavailable)
+
+    result = json.loads(run_async(_safe_resource(resource)))
+
+    assert result["ok"] is False
+    assert result["tool"] == "resource"
+    assert result["target"] is None
+    assert result["error_type"] == "logging_unavailable"
+    assert executed == []
+
+
+def test_server_main_continues_when_lifecycle_logging_is_unavailable(
+    monkeypatch, capsys
+):
+    calls = []
+    registered = []
+
+    class FakeServer:
+        def run(self, *, transport):
+            calls.append(transport)
+
+    def unavailable():
+        raise PermissionError("synthetic logging failure")
+
+    monkeypatch.setattr("nomad.mcp_logging.get_mcp_logger", unavailable)
+    monkeypatch.setattr("nomad.server.create_server", lambda **_: FakeServer())
+    monkeypatch.setattr(
+        "nomad.server.atexit.register",
+        lambda callback: registered.append(callback),
+    )
+
+    assert main() is None
+    assert calls == ["stdio"]
+    assert registered == [log_server_shutdown]
+    registered[0]()
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
 
 
 @pytest.mark.parametrize(

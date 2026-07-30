@@ -55,6 +55,12 @@ def main(argv: list[str] | None = None) -> int | None:
             )
         if bool(args.daemon_id) != bool(args.daemon_state):
             parser.error("--daemon-id and --daemon-state must be provided together")
+        bearer_token = os.environ.pop("NOMAD_MCP_BEARER_TOKEN", None) or None
+        if bearer_token is None or not bearer_token.strip():
+            parser.error(
+                "serve requires NOMAD_MCP_BEARER_TOKEN; "
+                "refusing to start an unauthenticated HTTP MCP server"
+            )
         if args.daemon_state:
             try:
                 claim_daemon_state(args.daemon_state, args.daemon_id)
@@ -62,8 +68,6 @@ def main(argv: list[str] | None = None) -> int | None:
                 parser.error(f"cannot claim daemon lifecycle state: {exc}")
 
         from nomad.server import main as server_main
-
-        bearer_token = os.environ.pop("NOMAD_MCP_BEARER_TOKEN", None) or None
 
         server_main(
             transport="streamable-http",
@@ -205,7 +209,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_project_argument(daemon_token_parser)
 
     codex_parser = subparsers.add_parser(
-        "codex", help="Configure Nomad's MCP integration for Codex CLI."
+        "codex", help="Configure Nomad's MCP integration for Codex."
     )
     codex_subparsers = codex_parser.add_subparsers(
         dest="codex_command",
@@ -214,7 +218,7 @@ def _build_parser() -> argparse.ArgumentParser:
     for codex_command in ("setup", "doctor", "repair"):
         command_parser = codex_subparsers.add_parser(
             codex_command,
-            help=f"{codex_command.capitalize()} the Codex CLI integration.",
+            help=f"{codex_command.capitalize()} the Codex MCP integration.",
         )
         _add_project_argument(command_parser)
         command_parser.add_argument(

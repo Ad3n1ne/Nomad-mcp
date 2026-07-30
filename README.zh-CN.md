@@ -44,46 +44,21 @@ pipx install nomad-mcp
 
 ## Codex 配置
 
-使用 `pipx` 安装后，在本地项目中启动 daemon：
+`nomad codex setup` 只是可选的 Codex 配置适配器，不是协议要求。任何 MCP
+宿主都可以直接使用标准 stdio 或 Streamable HTTP 连接 Nomad。
+
+在希望 Codex 控制的项目中运行：
 
 ```bash
-nomad daemon start --project "$PWD"
-nomad daemon status --project "$PWD"
+nomad codex setup --project "$PWD"
+nomad codex doctor --project "$PWD"
 ```
 
-生成该项目的 Codex 配置：
+适配器会启动或修复项目 daemon，并且只写入可信项目的
+`.codex/config.toml`；它不会修改用户级 Codex 配置或项目信任状态。解决命令
+报告的全局冲突后，彻底重启 Codex 以加载项目 MCP。
 
-```bash
-nomad client-config \
-  --transport http \
-  --project "$PWD" \
-  --name nomad-myproject \
-  --format toml
-```
-
-生成的配置只引用 bearer-token 环境变量，不保存 token。启动 Codex 前导出它：
-
-```bash
-export NOMAD_TOKEN_ENV_VAR="$(nomad daemon status --project "$PWD" |
-  python -c 'import json,sys; print(json.load(sys.stdin)["token_env_var"])')"
-export "$NOMAD_TOKEN_ENV_VAR=$(nomad daemon token --project "$PWD")"
-codex
-```
-
-macOS Codex Desktop 使用 `launchctl setenv` 设置同一个变量，然后彻底退出并
-重新打开 Codex：
-
-```bash
-launchctl setenv "$NOMAD_TOKEN_ENV_VAR" \
-  "$(nomad daemon token --project "$PWD")"
-```
-
-直接使用 `codex mcp add`、多项目隔离、生命周期命令、升级、安全边界和故障
-排查见 [Persistent MCP Daemon](docs/09-persistent-daemon.md)。
-
-### stdio 兼容模式
-
-不支持 Streamable HTTP 的客户端可以直接启动 nomad：
+其他 MCP 宿主可以直接通过 stdio 启动 Nomad：
 
 ```json
 {
@@ -96,16 +71,9 @@ launchctl setenv "$NOMAD_TOKEN_ENV_VAR" \
 }
 ```
 
-等价 TOML：
-
-```toml
-[mcp_servers.nomad]
-command = "uvx"
-args = ["--from", "nomad-mcp", "nomad"]
-startup_timeout_sec = 120
-```
-
-`nomad client-config` 可以为两种 transport 生成 JSON 或 TOML。
+`nomad client-config` 可以为标准 stdio 或 Streamable HTTP 客户端生成 JSON
+或 TOML。手工注册、生命周期、安全边界和排障见
+[Persistent MCP Daemon](docs/09-persistent-daemon.md)。
 
 ## 快速开始
 

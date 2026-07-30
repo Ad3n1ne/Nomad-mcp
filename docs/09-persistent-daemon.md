@@ -31,7 +31,18 @@ inline in client configuration.
 
 ## Register with Codex
 
-Add the endpoint:
+The project-scoped adapter performs the daemon and config steps together:
+
+```bash
+nomad codex setup --project "$PWD"
+nomad codex doctor --project "$PWD"
+```
+
+It writes only `.codex/config.toml`; user-level configuration and project trust
+remain manual security boundaries. Fully restart Codex whenever setup reports
+`codex_restart_required`.
+
+For manual registration, add the endpoint:
 
 ```bash
 codex mcp add nomad-myproject \
@@ -46,15 +57,17 @@ export "$NOMAD_TOKEN_ENV_VAR=$(nomad daemon token --project "$NOMAD_PROJECT")"
 codex
 ```
 
-For Codex Desktop on macOS, add it to the current GUI login session:
+This keeps the token out of command arguments. Same-user processes may still
+inspect process environments, so use the project-scoped token only on a trusted
+local machine.
 
-```bash
-launchctl setenv "$NOMAD_TOKEN_ENV_VAR" \
-  "$(nomad daemon token --project "$NOMAD_PROJECT")"
-```
-
-Fully quit and reopen Codex Desktop afterward. The `launchctl` value belongs to
-the current login session and may need to be restored after logout or restart.
+Codex Desktop on macOS normally requires a GUI login-session environment
+variable. Nomad deliberately does not run `launchctl setenv` automatically:
+that command places its value briefly in process arguments. Configure the
+login environment manually only if you accept that local exposure, then fully
+quit and reopen Codex Desktop. The value may need to be restored after logout
+or restart. Using Codex CLI from the exported shell avoids this `launchctl`
+argument exposure.
 
 The same configuration can be generated without manually reading status:
 

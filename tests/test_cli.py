@@ -406,25 +406,28 @@ def test_cli_client_config_http_requires_running_daemon(
     }
 
 
-def test_cli_serve_uses_streamable_http_defaults(monkeypatch):
+@pytest.mark.parametrize("bearer_token", [None, "", "   "])
+def test_cli_serve_rejects_missing_bearer_token(
+    monkeypatch,
+    capsys,
+    bearer_token,
+):
     calls = []
-    monkeypatch.delenv("NOMAD_MCP_BEARER_TOKEN", raising=False)
+    if bearer_token is None:
+        monkeypatch.delenv("NOMAD_MCP_BEARER_TOKEN", raising=False)
+    else:
+        monkeypatch.setenv("NOMAD_MCP_BEARER_TOKEN", bearer_token)
     monkeypatch.setattr(
         "nomad.server.main",
         lambda **kwargs: calls.append(kwargs),
     )
 
-    assert main(["serve"]) is None
+    with pytest.raises(SystemExit) as exc_info:
+        main(["serve"])
 
-    assert calls == [
-        {
-            "transport": "streamable-http",
-            "host": "127.0.0.1",
-            "port": 8765,
-            "path": "/mcp",
-            "bearer_token": None,
-        }
-    ]
+    assert exc_info.value.code == 2
+    assert "requires NOMAD_MCP_BEARER_TOKEN" in capsys.readouterr().err
+    assert calls == []
 
 
 def test_cli_serve_passes_explicit_http_options(monkeypatch):
@@ -513,6 +516,7 @@ def test_cli_serve_requires_complete_daemon_claim_arguments(hidden_args):
 
 
 def test_cli_serve_rejects_failed_daemon_claim(monkeypatch):
+    monkeypatch.setenv("NOMAD_MCP_BEARER_TOKEN", "environment-secret")
     monkeypatch.setattr(
         daemon,
         "claim_daemon_state",

@@ -6,11 +6,12 @@ import json
 import logging
 import os
 import re
+import stat
 import sys
 import traceback
 from inspect import Signature
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 
 LOG_ENV_VAR = "NOMAD_MCP_LOG_PATH"
@@ -32,6 +33,35 @@ SAFE_VALUE_KEYS = {"target", "task_name", "tail_lines"}
 USERINFO_RE = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://)[^/\s:@]+:[^/\s:@]+@")
 AUTH_RE = re.compile(
     r"((?:authorization|auth_token)\s*(?::|=)\s*(?:Bearer|Basic|Token)\s+)[^\s]+",
+    re.IGNORECASE,
+)
+PYPI_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])(?P<prefix>pypi-)[A-Za-z0-9_-]{20,}",
+    re.IGNORECASE,
+)
+GITHUB_TOKEN_RE = re.compile(
+    r"""
+    (?<![A-Za-z0-9_])
+    (?P<prefix>
+        github_pat_
+        |
+        gh[pousr]_
+    )
+    [A-Za-z0-9_]{20,}
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+OPENAI_PROJECT_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])(?P<prefix>sk-proj-)[A-Za-z0-9_-]{20,}"
+)
+OPENAI_LEGACY_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])(?P<prefix>sk-)[A-Za-z0-9]{20,}"
+)
+AWS_ACCESS_KEY_RE = re.compile(
+    r"(?<![A-Z0-9])(?P<prefix>A[KS]IA)[A-Z0-9]{16}(?![A-Z0-9])"
+)
+SLACK_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])(?P<prefix>xox[abepors]-)[A-Za-z0-9-]{20,}",
     re.IGNORECASE,
 )
 PEM_PRIVATE_KEY_RE = re.compile(
@@ -72,6 +102,26 @@ ASSIGNMENT_RE = re.compile(
 _LOGGER: logging.Logger | None = None
 
 
+class _SecureFileHandler(logging.FileHandler):
+    """A FileHandler whose stream is opened through validated directory fds."""
+
+    def __init__(self, filename: Path, *, tighten_existing_parent: bool) -> None:
+        self._tighten_existing_parent = tighten_existing_parent
+        super().__init__(filename, mode="a", encoding="utf-8", delay=True)
+        self.stream = self._open()
+
+    def _open(self) -> TextIO:
+        fd = _open_secure_log_file(
+            Path(self.baseFilename),
+            tighten_existing_parent=self._tighten_existing_parent,
+        )
+        try:
+            return os.fdopen(fd, self.mode, encoding=self.encoding)
+        except Exception:
+            os.close(fd)
+            raise
+
+
 def get_log_path() -> Path:
     """Returns the MCP log path, honoring tests or operator overrides."""
     override = os.environ.get(LOG_ENV_VAR)
@@ -89,34 +139,43 @@ def get_mcp_logger() -> logging.Logger:
     if _LOGGER is logger and _logger_points_to(logger, log_path):
         return logger
 
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-    for handler in list(logger.handlers):
-        logger.removeHandler(handler)
-        handler.close()
-
-    handler = logging.FileHandler(log_path, encoding="utf-8")
-    handler.setFormatter(
+    new_handler = _SecureFileHandler(
+        log_path,
+        tighten_existing_parent=not bool(os.environ.get(LOG_ENV_VAR)),
+    )
+    new_handler.setFormatter(
         logging.Formatter("%(asctime)s %(levelname)s [pid=%(process)d] %(message)s")
     )
-    logger.addHandler(handler)
+
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    for old_handler in list(logger.handlers):
+        logger.removeHandler(old_handler)
+        old_handler.close()
+
+    logger.addHandler(new_handler)
     _LOGGER = logger
     return logger
 
 
 def log_server_startup(cwd: str, version: str) -> None:
-    get_mcp_logger().info(
-        "server startup cwd=%s python=%s version=%s log_path=%s",
-        cwd,
-        sys.version.replace("\n", " "),
-        version,
-        get_log_path(),
-    )
+    try:
+        get_mcp_logger().info(
+            "server startup cwd=%s python=%s version=%s log_path=%s",
+            cwd,
+            sys.version.replace("\n", " "),
+            version,
+            get_log_path(),
+        )
+    except BaseException:
+        return
 
 
 def log_server_shutdown() -> None:
-    get_mcp_logger().info("server shutdown")
+    try:
+        get_mcp_logger().info("server shutdown")
+    except BaseException:
+        return
 
 
 def summarize_call(
@@ -172,6 +231,12 @@ def redact_text(value: str) -> str:
     redacted = PEM_PRIVATE_KEY_RE.sub(_redact_pem_private_key, redacted)
     redacted = _redact_sensitive_assignments(redacted)
     redacted = AUTH_RE.sub(r"\1[REDACTED]", redacted)
+    redacted = PYPI_TOKEN_RE.sub(r"\g<prefix>[REDACTED]", redacted)
+    redacted = GITHUB_TOKEN_RE.sub(r"\g<prefix>[REDACTED]", redacted)
+    redacted = OPENAI_PROJECT_TOKEN_RE.sub(r"\g<prefix>[REDACTED]", redacted)
+    redacted = OPENAI_LEGACY_TOKEN_RE.sub(r"\g<prefix>[REDACTED]", redacted)
+    redacted = AWS_ACCESS_KEY_RE.sub(r"\g<prefix>[REDACTED]", redacted)
+    redacted = SLACK_TOKEN_RE.sub(r"\g<prefix>[REDACTED]", redacted)
     return redacted
 
 
@@ -248,12 +313,112 @@ def _is_sensitive_assignment_key(key: str) -> bool:
 
 
 def _logger_points_to(logger: logging.Logger, log_path: Path) -> bool:
-    expected = str(log_path)
+    expected = os.path.abspath(os.fspath(log_path))
     return any(
         isinstance(handler, logging.FileHandler)
         and getattr(handler, "baseFilename", None) == expected
         for handler in logger.handlers
     )
+
+
+def _open_secure_log_file(
+    log_path: Path,
+    *,
+    tighten_existing_parent: bool,
+) -> int:
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise OSError("secure MCP logging requires O_NOFOLLOW support")
+
+    absolute_path = Path(os.path.abspath(os.fspath(log_path)))
+    if not absolute_path.name:
+        raise ValueError("MCP log path must name a file")
+
+    parent_fd = _open_secure_parent(
+        absolute_path.parent,
+        tighten_existing=tighten_existing_parent,
+    )
+    try:
+        flags = (
+            os.O_WRONLY
+            | os.O_APPEND
+            | os.O_CREAT
+            | os.O_CLOEXEC
+            | os.O_NOFOLLOW
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        fd = os.open(absolute_path.name, flags, 0o600, dir_fd=parent_fd)
+        try:
+            file_stat = os.fstat(fd)
+            _validate_log_file(file_stat, absolute_path)
+            os.fchmod(fd, 0o600)
+            _validate_log_file(os.fstat(fd), absolute_path, expected_mode=0o600)
+            return fd
+        except Exception:
+            os.close(fd)
+            raise
+    finally:
+        os.close(parent_fd)
+
+
+def _open_secure_parent(parent: Path, *, tighten_existing: bool) -> int:
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    current_fd = os.open(os.path.sep, flags)
+    parent_created = False
+    try:
+        for component in parent.parts[1:]:
+            component_created = False
+            try:
+                next_fd = os.open(component, flags, dir_fd=current_fd)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(component, 0o700, dir_fd=current_fd)
+                    component_created = True
+                except FileExistsError:
+                    pass
+                next_fd = os.open(component, flags, dir_fd=current_fd)
+            os.close(current_fd)
+            current_fd = next_fd
+            parent_created = component_created
+
+        parent_stat = os.fstat(current_fd)
+        if not stat.S_ISDIR(parent_stat.st_mode):
+            raise PermissionError(f"MCP log parent is not a directory: {parent}")
+        if parent_stat.st_uid != os.getuid():
+            raise PermissionError(f"MCP log parent is not owned by the current user: {parent}")
+        parent_mode = stat.S_IMODE(parent_stat.st_mode)
+        if parent_created or tighten_existing:
+            os.fchmod(current_fd, 0o700)
+            parent_mode = stat.S_IMODE(os.fstat(current_fd).st_mode)
+            if parent_mode != 0o700:
+                raise PermissionError(
+                    f"MCP log parent permissions are not 0700: {parent}"
+                )
+        elif parent_mode & 0o022:
+            raise PermissionError(
+                f"Custom MCP log parent is group/world-writable: {parent}"
+            )
+        return current_fd
+    except Exception:
+        os.close(current_fd)
+        raise
+
+
+def _validate_log_file(
+    file_stat: os.stat_result,
+    log_path: Path,
+    *,
+    expected_mode: int | None = None,
+) -> None:
+    if not stat.S_ISREG(file_stat.st_mode):
+        raise PermissionError(f"MCP log is not a regular file: {log_path}")
+    if file_stat.st_uid != os.getuid():
+        raise PermissionError(f"MCP log is not owned by the current user: {log_path}")
+    if file_stat.st_nlink != 1:
+        raise PermissionError(f"MCP log must have exactly one hard link: {log_path}")
+    if expected_mode is not None and stat.S_IMODE(file_stat.st_mode) != expected_mode:
+        raise PermissionError(
+            f"MCP log permissions are not {expected_mode:04o}: {log_path}"
+        )
 
 
 def _redact_value(value: Any) -> Any:

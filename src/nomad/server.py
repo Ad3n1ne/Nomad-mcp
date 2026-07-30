@@ -50,13 +50,53 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 DEFAULT_PATH = "/mcp"
 Transport = Literal["stdio", "sse", "streamable-http"]
+HTTP_TRANSPORTS = frozenset({"sse", "streamable-http"})
+
+
+def _require_http_bearer_token(
+    transport: str,
+    bearer_token: str | None,
+) -> None:
+    if transport in HTTP_TRANSPORTS and (
+        not isinstance(bearer_token, str) or not bearer_token.strip()
+    ):
+        raise ValueError(
+            "bearer token is required for sse and streamable-http MCP transports"
+        )
+
+
+class NomadFastMCP(FastMCP):
+    """FastMCP server that cannot expose an unauthenticated HTTP app."""
+
+    def __init__(self, *args: Any, http_bearer_token: str | None, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._http_bearer_token = http_bearer_token
+
+    def run(
+        self,
+        transport: Transport = "stdio",
+        mount_path: str | None = None,
+    ) -> None:
+        _require_http_bearer_token(transport, self._http_bearer_token)
+        super().run(transport=transport, mount_path=mount_path)
+
+    def streamable_http_app(self):
+        _require_http_bearer_token(
+            "streamable-http",
+            self._http_bearer_token,
+        )
+        return super().streamable_http_app()
+
+    def sse_app(self, mount_path: str | None = None):
+        _require_http_bearer_token("sse", self._http_bearer_token)
+        return super().sse_app(mount_path=mount_path)
 
 
 class StaticBearerTokenVerifier:
     """Verifies one static bearer token without retaining its plaintext."""
 
     def __init__(self, token: str, *, resource: str) -> None:
-        if not isinstance(token, str) or not token:
+        if not isinstance(token, str) or not token.strip():
             raise ValueError("bearer token must be a non-empty string")
         self._token_digest = hashlib.sha256(token.encode("utf-8")).digest()
         self._resource = resource
@@ -95,7 +135,11 @@ def _safe_tool(func: Callable[..., str]) -> Callable[..., Awaitable[str]]:
 
     @functools.wraps(func)
     async def wrapper(*args: Any, **kwargs: Any) -> str:
-        logger = get_mcp_logger()
+        target = kwargs.get("target") if isinstance(kwargs.get("target"), str) else None
+        try:
+            logger = get_mcp_logger()
+        except BaseException as exc:
+            return _logging_unavailable_result(tool_name, exc, target=target)
         logger.info(
             "tool entry name=%s params=%s",
             tool_name,
@@ -112,7 +156,6 @@ def _safe_tool(func: Callable[..., str]) -> Callable[..., Awaitable[str]]:
             )
             raise
         except BaseException as exc:
-            target = kwargs.get("target") if isinstance(kwargs.get("target"), str) else None
             exc_summary = redact_text(f"{type(exc).__name__}: {exc}")
             logger.error(
                 "tool exception name=%s target=%s exception=%s\n%s",
@@ -145,7 +188,10 @@ def _safe_resource(func: Callable[..., str]) -> Callable[..., Awaitable[str]]:
 
     @functools.wraps(func)
     async def wrapper(*args: Any, **kwargs: Any) -> str:
-        logger = get_mcp_logger()
+        try:
+            logger = get_mcp_logger()
+        except BaseException as exc:
+            return _logging_unavailable_result(resource_name, exc)
         logger.info(
             "resource entry name=%s params=%s",
             resource_name,
@@ -186,8 +232,36 @@ def _safe_resource(func: Callable[..., str]) -> Callable[..., Awaitable[str]]:
     return wrapper
 
 
+def _logging_unavailable_result(
+    tool_name: str,
+    exc: BaseException,
+    *,
+    target: str | None = None,
+) -> str:
+    try:
+        diagnostic = redact_text(f"{type(exc).__name__}: {exc}")
+    except BaseException:
+        diagnostic = f"{type(exc).__name__}: logging initialization failed"
+    return json.dumps(
+        {
+            "ok": False,
+            "tool": tool_name,
+            "target": target,
+            "error_type": "logging_unavailable",
+            "message": "Nomad MCP logging is unavailable; the operation was not executed.",
+            "details": {},
+            "recoverable": True,
+            "data": {},
+            "diagnostics": [diagnostic],
+            "next_action": None,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
 def health() -> str:
-    """Reports local Nomad MCP server process health; call this before the first Nomad tool use in a Codex task."""
+    """Reports process health; call this before the first Nomad tool use in an MCP client session."""
     return success_result(
         tool="health",
         message="Nomad MCP server is running.",
@@ -306,7 +380,7 @@ def create_server(
     if not isinstance(stateless_http, bool):
         raise ValueError("stateless_http must be a boolean")
     if bearer_token is not None and (
-        not isinstance(bearer_token, str) or not bearer_token
+        not isinstance(bearer_token, str) or not bearer_token.strip()
     ):
         raise ValueError("bearer token must be a non-empty string")
     if not is_loopback_host(host):
@@ -329,8 +403,9 @@ def create_server(
             resource=endpoint_url,
         )
 
-    server = FastMCP(
+    server = NomadFastMCP(
         "nomad",
+        http_bearer_token=bearer_token,
         log_level="ERROR",
         host=host,
         port=port,
@@ -367,6 +442,7 @@ def main(
     bearer_token: str | None = None,
 ) -> None:
     """Server CLI Entry."""
+    _require_http_bearer_token(transport, bearer_token)
     if not is_loopback_host(host):
         raise ValueError(
             "Nomad 0.2.0 only supports loopback HTTP hosts; "
